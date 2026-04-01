@@ -24,11 +24,6 @@ from rtm_pymmcore.microscope.base import AbstractMicroscope
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Thread-safe napari viewer updater
-# ---------------------------------------------------------------------------
-
-
 class _ViewerUpdater(QObject):
     """QObject living on the main thread that receives images via a Qt signal.
 
@@ -55,12 +50,7 @@ class _ViewerUpdater(QObject):
                     metadata={"label": label},
                 )
         except Exception as exc:
-            print(f"[_ViewerUpdater] ERROR: {type(exc).__name__}: {exc}")
-
-
-# ---------------------------------------------------------------------------
-# Storage-only pipeline stub
-# ---------------------------------------------------------------------------
+            logger.error(f"[_ViewerUpdater] ERROR: {type(exc).__name__}: {exc}")
 
 
 class _StorageOnlyPipeline:
@@ -151,12 +141,6 @@ class KeepDMDAlive:
         self.mmc.displaySLMImage(self.mmc.getSLMDevice())
 
 
-
-# ---------------------------------------------------------------------------
-# Microscope
-# ---------------------------------------------------------------------------
-
-
 class InscoperMicroscope(AbstractMicroscope):
     """Inscoper adapter microscope — drop-in replacement for any rtm-pymmcore
     microscope class.
@@ -217,29 +201,6 @@ class InscoperMicroscope(AbstractMicroscope):
             main_camera=self.main_camera,
         )
 
-        # # Force camera initialisation if event-based init didn't fire.
-        # # In some contexts (e.g. Jupyter notebooks) the device dispatcher's
-        # # init events may not reach the CameraManager, leaving
-        # # map_camera_device empty even though all_cameras_to_load is populated.
-        # from inscoper_useq.basic_element.device._all_devices import AllDevices
-
-        # _cm = AllDevices.camera_manager
-        # if _cm is not None and not _cm.map_camera_device:
-        #     logger.info(
-        #         "Forcing camera initialisation for %d cameras...",
-        #         len(_cm.all_cameras_to_load),
-        #     )
-        #     for cam_dev in _cm.all_cameras_to_load:
-        #         _cm.init_camera(cam_dev)
-
-        # logger.info(
-        #     "Inscoper bridge initialised (config=%s, camera=%s)",
-        #     self.config_folder,
-        #     self.main_camera,
-        # )
-
-        # UseqBridge implements the CMMCorePlus-like API directly.
-        # No adapter needed — same pattern as MMDemo using CMMCorePlus.
         self.mmc.setChannelGroup(self.CHANNEL_GROUP)
         try:
             slm = self.mmc.getSLMDevice()
@@ -293,10 +254,6 @@ class InscoperMicroscope(AbstractMicroscope):
         """Disconnect a previously connected ``frameReady`` callback."""
         self.mmc.mda.events.frameReady.disconnect(callback)
 
-    # ------------------------------------------------------------------
-    # DMD calibration
-    # ------------------------------------------------------------------
-
     def calibrate_dmd(
         self,
         verbose: bool = False,
@@ -331,7 +288,7 @@ class InscoperMicroscope(AbstractMicroscope):
         from rtm_pymmcore.core.dmd import DMD
 
         if not isinstance(self.dmd, DMD):
-            print(f"{self.dmd=}")
+            logger.info(f"{self.dmd=}")
             raise RuntimeError(
                 "No DMD is attached to this InscoperMicroscope.  Provide a "
                 "dmd_calibration_profile (or set DMD_CALIBRATION_PROFILE on a "
@@ -362,10 +319,6 @@ class InscoperMicroscope(AbstractMicroscope):
     def resolve_group(self, config_name: str) -> str:
         """Return the channel group, delegating to the bridge."""
         return self.mmc.getChannelGroup() or self.CHANNEL_GROUP
-
-    # ------------------------------------------------------------------
-    # Live napari viewer
-    # ------------------------------------------------------------------
 
     def set_viewer(self, viewer) -> None:
         """Attach a napari viewer for live image display during acquisition.
@@ -400,10 +353,6 @@ class InscoperMicroscope(AbstractMicroscope):
         )
         updater.update_requested.emit(img.copy(), label)
 
-    # ------------------------------------------------------------------
-    # Pipeline — accept optional storage_path
-    # ------------------------------------------------------------------
-
     def set_pipeline(self, pipeline, *, storage_path: str = None) -> None:
         """Set the image-processing pipeline.
 
@@ -428,10 +377,6 @@ class InscoperMicroscope(AbstractMicroscope):
             self._storage_path = pipeline.storage_path
         else:
             self._storage_path = None
-
-    # ------------------------------------------------------------------
-    # Experiment lifecycle
-    # ------------------------------------------------------------------
 
     def run_experiment(self, df_acquire) -> None:
         """Run the experiment from a *df_acquire* DataFrame.
@@ -479,10 +424,6 @@ class InscoperMicroscope(AbstractMicroscope):
                         "No napari viewer found — live display disabled. "
                         "Call mic.set_viewer(viewer) before run_experiment() "
                         "to enable it."
-                    )
-                    print(
-                        "[InscoperMicroscope] WARNING: No napari viewer found. "
-                        "Call mic.set_viewer(viewer) before run_experiment() for live display."
                     )
             except ImportError:
                 pass  # napari not installed — skip
