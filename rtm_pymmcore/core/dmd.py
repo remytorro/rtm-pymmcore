@@ -59,9 +59,25 @@ class DMD:
         """
 
         if self.affine is None:
-            raise ValueError(
-                "DMD not calibrated. affine matrix is None. Run calibrate() first."
+            import warnings
+            warnings.warn(
+                "DMD not calibrated. Using identity transform (no warping).",
+                UserWarning,
+                stacklevel=2,
             )
+            # Pass through: just resize to DMD dimensions
+            img_out = np.asarray(img, dtype=float)
+            # Scale float [0,1] masks to [0,255] BEFORE uint8 cast
+            if img_out.max() <= 1.0 and img_out.max() > 0:
+                img_out = img_out * 255.0
+            if img_out.shape != (self.height, self.width):
+                img_out = skimage.transform.resize(
+                    img_out,
+                    (self.height, self.width),
+                    order=0,
+                    preserve_range=True,
+                )
+            return img_out.astype(np.uint8)
 
         img_transformed = skimage.transform.warp(
             img,
@@ -73,10 +89,10 @@ class DMD:
             clip=True,
             preserve_range=True,
         )
-        img_transformed = img_transformed.astype(np.uint8)
-        if np.max(img_transformed) == 1:
-            img_transformed = img_transformed * 255
-        return img_transformed
+        # Scale float [0,1] masks to [0,255] BEFORE uint8 cast
+        if img_transformed.max() <= 1.0 and img_transformed.max() > 0:
+            img_transformed = img_transformed * 255.0
+        return img_transformed.astype(np.uint8)
 
     def all_on(self):
         """turn on projector all pixels for a long time"""
@@ -229,7 +245,10 @@ class DMD:
             )
             events.append(event_p)
 
-        self.mmc.mda.events.frameReady.disconnect()
+        try:
+            self.mmc.mda.events.frameReady.disconnect()
+        except Exception:
+            pass
 
         @self.mmc.mda.events.frameReady.connect
         def new_frame(img: np.ndarray, event: MDAEvent):
@@ -241,6 +260,14 @@ class DMD:
         for event in events:
             self.mmc.mda.run([event])
             time.sleep(0.1)
+
+        # Disconnect IMMEDIATELY after snapping to prevent the closure
+        # from firing during subsequent acquisitions.
+        try:
+            self.mmc.mda.events.frameReady.disconnect()
+        except Exception:
+            pass
+
         calibration_images = np.array(calibration_images)
 
         for img in calibration_images:
@@ -260,8 +287,11 @@ class DMD:
             max_trials=5000,
         )
 
-        if np.sum(inliers) < 4:
-            self.mmc.mda.events.frameReady.disconnect()
+        if inliers is None or np.sum(inliers) < 4:
+            try:
+                self.mmc.mda.events.frameReady.disconnect()
+            except Exception:
+                pass
             self.mmc.mda.run(
                 [
                     MDAEvent(
@@ -322,15 +352,25 @@ class DMD:
                 )
                 events.append(event_p)
 
-            self.mmc.mda.events.frameReady.disconnect()
+            try:
+                self.mmc.mda.events.frameReady.disconnect()
+            except Exception:
+                pass
 
             @self.mmc.mda.events.frameReady.connect
             def new_frame(img: np.ndarray, event: MDAEvent):
                 test_image.append(img)
 
-            for event in events:
-                self.mmc.mda.run([event])
-                time.sleep(0.5)
+            acq_thread = self.mmc.mda.run(events)
+            if acq_thread is not None:
+                acq_thread.join(timeout=120)
+            else:
+                timeout = 30
+                poll_interval = 0.1
+                elapsed = 0.0
+                while len(test_image) < len(events) and elapsed < timeout:
+                    time.sleep(poll_interval)
+                    elapsed += poll_interval
             calibration_images = np.array(calibration_images)
             for img in test_image:
                 img = skimage.filters.gaussian(img, sigma=1)
@@ -363,7 +403,10 @@ class DMD:
             axs[3].set_ylim(camera_height, 0)
 
             plt.show()
-        self.mmc.mda.events.frameReady.disconnect()
+        try:
+            self.mmc.mda.events.frameReady.disconnect()
+        except Exception:
+            pass
         self.mmc.mda.run(
             [
                 MDAEvent(

@@ -320,7 +320,7 @@ class Analyzer:
         try:
             # Put in storage queue (high priority)
             # Non-blocking: if queue full, just skip (images before it will be stored)
-            self._storage_queue.put_nowait((img, event, metadata, "raw"))
+            self._storage_queue.put((img, event, metadata, "raw"))
             if self.debug:
                 self._debug_counter += 1
                 if (self._debug_counter % self.debug_every) == 0:
