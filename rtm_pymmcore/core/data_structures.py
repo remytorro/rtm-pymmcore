@@ -16,7 +16,7 @@ class FovState:
     """Per-FOV mutable state for tracking and stimulation."""
 
     def __init__(self):
-        self.stim_mask_queue = queue.SimpleQueue()
+        self.stim_mask_queue = queue.Queue()
         self.tracks_queue = queue.SimpleQueue()
         self.parquet_lock = threading.Lock()
         self.linker = None
