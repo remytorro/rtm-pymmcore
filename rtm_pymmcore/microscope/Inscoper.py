@@ -50,7 +50,7 @@ class _ViewerUpdater(QObject):
                     metadata={"label": label},
                 )
         except Exception as exc:
-            logger.error(f"[_ViewerUpdater] ERROR: {type(exc).__name__}: {exc}")
+            print(f"[_ViewerUpdater] ERROR: {type(exc).__name__}: {exc}")
 
 
 class _StorageOnlyPipeline:
@@ -117,8 +117,15 @@ class KeepDMDAlive:
         while self.is_running:
             current_time = time.time()
             if current_time - self.last_wakeup > 60:  # Wake up every minute
-                self.wakeup_dmd()
-                self.last_wakeup = current_time
+                # Skip wakeup if a FRAP stimulation is currently in progress
+                # to avoid interfering with the galvo sequence on the C++ bridge.
+                frap_active = False
+                frap_scanner = getattr(self.mmc, "_frap_scanner", None)
+                if frap_scanner is not None:
+                    frap_active = getattr(frap_scanner, "_frap_active", False)
+                if not frap_active:
+                    self.wakeup_dmd()
+                    self.last_wakeup = current_time
             time.sleep(5)
 
     def stop(self):
@@ -139,6 +146,12 @@ class KeepDMDAlive:
         time.sleep(5)
         self.mmc.setSLMExposure(self.mmc.getSLMDevice(), 100)
         self.mmc.displaySLMImage(self.mmc.getSLMDevice())
+
+
+
+# ---------------------------------------------------------------------------
+# Microscope
+# ---------------------------------------------------------------------------
 
 
 class InscoperMicroscope(AbstractMicroscope):
@@ -201,6 +214,29 @@ class InscoperMicroscope(AbstractMicroscope):
             main_camera=self.main_camera,
         )
 
+        # # Force camera initialisation if event-based init didn't fire.
+        # # In some contexts (e.g. Jupyter notebooks) the device dispatcher's
+        # # init events may not reach the CameraManager, leaving
+        # # map_camera_device empty even though all_cameras_to_load is populated.
+        # from inscoper_useq.basic_element.device._all_devices import AllDevices
+
+        # _cm = AllDevices.camera_manager
+        # if _cm is not None and not _cm.map_camera_device:
+        #     logger.info(
+        #         "Forcing camera initialisation for %d cameras...",
+        #         len(_cm.all_cameras_to_load),
+        #     )
+        #     for cam_dev in _cm.all_cameras_to_load:
+        #         _cm.init_camera(cam_dev)
+
+        # logger.info(
+        #     "Inscoper bridge initialised (config=%s, camera=%s)",
+        #     self.config_folder,
+        #     self.main_camera,
+        # )
+
+        # UseqBridge implements the CMMCorePlus-like API directly.
+        # No adapter needed — same pattern as MMDemo using CMMCorePlus.
         self.mmc.setChannelGroup(self.CHANNEL_GROUP)
         try:
             slm = self.mmc.getSLMDevice()
@@ -230,6 +266,28 @@ class InscoperMicroscope(AbstractMicroscope):
                 affine_matrix=self.affine_calibration_matrix,
             )
             logger.info("DMD initialised (profile=%s).", self.DMD_CALIBRATION_PROFILE)
+
+            # FRAP-as-SLM fix: when the bridge uses a FRAP galvo scanner
+            # instead of a physical SLM, getSLMDevice() returns "" and DMD
+            # ends up with height=0, width=0.  Substitute camera dimensions
+            # so that affine_transform produces correctly-shaped masks and
+            # calibration points are generated over the camera FOV.
+            if getattr(self.mmc, "use_frap_as_slm", False):
+                cam_h = self.mmc.getImageHeight()
+                cam_w = self.mmc.getImageWidth()
+                if (self.dmd.height == 0 or self.dmd.width == 0) and cam_h > 0 and cam_w > 0:
+                    self.dmd.height = cam_h
+                    self.dmd.width = cam_w
+                    self.dmd.sample_mask_on = np.full((cam_h, cam_w), 255, dtype=np.uint8)
+                    self.dmd.sample_mask_off = np.zeros((cam_h, cam_w), dtype=np.uint8)
+                    # Use the FRAP device name so SLMImage.device is meaningful
+                    frap_scanner = getattr(self.mmc, "_frap_scanner", None)
+                    if frap_scanner is not None:
+                        self.dmd.name = frap_scanner.device_name
+                    logger.info(
+                        "DMD dimensions overridden for FRAP-as-SLM: %dx%d (camera FOV).",
+                        cam_w, cam_h,
+                    )
         except Exception:
             logger.exception("Failed to initialise DMD — calibrate_dmd() will be unavailable.")
         
@@ -253,6 +311,10 @@ class InscoperMicroscope(AbstractMicroscope):
     ) -> None:
         """Disconnect a previously connected ``frameReady`` callback."""
         self.mmc.mda.events.frameReady.disconnect(callback)
+
+    # ------------------------------------------------------------------
+    # DMD calibration
+    # ------------------------------------------------------------------
 
     def calibrate_dmd(
         self,
@@ -288,7 +350,7 @@ class InscoperMicroscope(AbstractMicroscope):
         from rtm_pymmcore.core.dmd import DMD
 
         if not isinstance(self.dmd, DMD):
-            logger.info(f"{self.dmd=}")
+            print(f"{self.dmd=}")
             raise RuntimeError(
                 "No DMD is attached to this InscoperMicroscope.  Provide a "
                 "dmd_calibration_profile (or set DMD_CALIBRATION_PROFILE on a "
@@ -319,6 +381,10 @@ class InscoperMicroscope(AbstractMicroscope):
     def resolve_group(self, config_name: str) -> str:
         """Return the channel group, delegating to the bridge."""
         return self.mmc.getChannelGroup() or self.CHANNEL_GROUP
+
+    # ------------------------------------------------------------------
+    # Live napari viewer
+    # ------------------------------------------------------------------
 
     def set_viewer(self, viewer) -> None:
         """Attach a napari viewer for live image display during acquisition.
@@ -353,6 +419,10 @@ class InscoperMicroscope(AbstractMicroscope):
         )
         updater.update_requested.emit(img.copy(), label)
 
+    # ------------------------------------------------------------------
+    # Pipeline — accept optional storage_path
+    # ------------------------------------------------------------------
+
     def set_pipeline(self, pipeline, *, storage_path: str = None) -> None:
         """Set the image-processing pipeline.
 
@@ -377,6 +447,10 @@ class InscoperMicroscope(AbstractMicroscope):
             self._storage_path = pipeline.storage_path
         else:
             self._storage_path = None
+
+    # ------------------------------------------------------------------
+    # Experiment lifecycle
+    # ------------------------------------------------------------------
 
     def run_experiment(self, df_acquire) -> None:
         """Run the experiment from a *df_acquire* DataFrame.
@@ -424,6 +498,10 @@ class InscoperMicroscope(AbstractMicroscope):
                         "No napari viewer found — live display disabled. "
                         "Call mic.set_viewer(viewer) before run_experiment() "
                         "to enable it."
+                    )
+                    print(
+                        "[InscoperMicroscope] WARNING: No napari viewer found. "
+                        "Call mic.set_viewer(viewer) before run_experiment() for live display."
                     )
             except ImportError:
                 pass  # napari not installed — skip
