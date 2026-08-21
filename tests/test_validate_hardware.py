@@ -10,107 +10,11 @@ import warnings
 
 import pytest
 
-from rtm_pymmcore.core.data_structures import Channel, PowerChannel, RTMEvent
-from rtm_pymmcore.core.utils import validate_hardware
+from faro.core.data_structures import Channel, PowerChannel, RTMEvent, wait
+from faro.core.utils import validate_hardware
 
+from tests.fake_mmc import build_validation_core as _core
 
-# ---------------------------------------------------------------------------
-# Fake CMMCorePlus — just enough API surface for validate_hardware
-# ---------------------------------------------------------------------------
-
-class FakePropertySetting:
-    """Minimal mock of a Micro-Manager PropertySetting."""
-
-    def __init__(self, device, prop, value):
-        self._device = device
-        self._prop = prop
-        self._value = value
-
-    def getDeviceLabel(self):
-        return self._device
-
-    def getPropertyName(self):
-        return self._prop
-
-    def getPropertyValue(self):
-        return self._value
-
-
-class FakeConfigData:
-    """Minimal mock of a Micro-Manager Configuration (list of PropertySettings)."""
-
-    def __init__(self, settings: list[FakePropertySetting]):
-        self._settings = settings
-
-    def size(self):
-        return len(self._settings)
-
-    def getSetting(self, i):
-        return self._settings[i]
-
-
-class FakeMMCore:
-    """Minimal mock of CMMCorePlus for hardware validation tests."""
-
-    def __init__(
-        self,
-        *,
-        config_groups: dict[str, list[str]] | None = None,
-        camera: str = "Camera",
-        property_limits: dict[tuple[str, str], tuple[float, float]] | None = None,
-        devices: dict[str, list[str]] | None = None,
-        config_data: dict[tuple[str, str], list[tuple[str, str, str]]] | None = None,
-        channel_group: str = "",
-    ):
-        self._config_groups = config_groups or {
-            "Channel": ["phase-contrast", "DAPI", "membrane"],
-        }
-        self._camera = camera
-        # (device, property) → (lo, hi)
-        self._property_limits = property_limits or {}
-        # device_name → [property_names]
-        self._devices = devices or {}
-        # (group, config) → [(device, property, value), ...]
-        self._config_data = config_data or {}
-        self._channel_group = channel_group
-
-    def getAvailableConfigGroups(self):
-        return list(self._config_groups.keys())
-
-    def getAvailableConfigs(self, group):
-        return self._config_groups.get(group, [])
-
-    def getCameraDevice(self):
-        return self._camera
-
-    def getChannelGroup(self):
-        return self._channel_group
-
-    def getLoadedDevices(self):
-        return list(self._devices.keys())
-
-    def getDevicePropertyNames(self, device):
-        return self._devices.get(device, [])
-
-    def getConfigData(self, group, config):
-        settings = self._config_data.get((group, config), [])
-        return FakeConfigData([FakePropertySetting(*s) for s in settings])
-
-    def hasPropertyLimits(self, device, prop):
-        return (device, prop) in self._property_limits
-
-    def getPropertyLowerLimit(self, device, prop):
-        lims = self._property_limits.get((device, prop))
-        return lims[0] if lims else 0.0
-
-    def getPropertyUpperLimit(self, device, prop):
-        lims = self._property_limits.get((device, prop))
-        return lims[1] if lims else 0.0
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _make_events(*, channels=None, stim_channels=None, n=3):
     """Return a list of RTMEvents with the given channels."""
@@ -133,12 +37,12 @@ def _make_events(*, channels=None, stim_channels=None, n=3):
 class TestChannelConfigExistence:
 
     def test_valid_config_passes(self):
-        mmc = FakeMMCore()
+        mmc = _core()
         events = _make_events(channels=[Channel("phase-contrast", 50)])
         assert validate_hardware(events, mmc) is True
 
     def test_unknown_config_fails(self):
-        mmc = FakeMMCore()
+        mmc = _core()
         events = _make_events(channels=[Channel("GFP", 50)])
 
         with warnings.catch_warnings(record=True) as w:
@@ -150,7 +54,7 @@ class TestChannelConfigExistence:
         assert any("not found" in str(warning.message) for warning in w)
 
     def test_stim_channel_unknown_fails(self):
-        mmc = FakeMMCore()
+        mmc = _core()
         events = _make_events(
             channels=[Channel("phase-contrast", 50)],
             stim_channels=[Channel("nonexistent-laser", 100)],
@@ -163,9 +67,15 @@ class TestChannelConfigExistence:
         assert result is False
         assert any("nonexistent-laser" in str(warning.message) for warning in w)
 
+    def test_wait_event_ignored(self):
+        """A WaitEvent has no channels and must not trip config checks."""
+        mmc = _core()
+        events = _make_events(channels=[Channel("phase-contrast", 50)]) + [wait(5.0)]
+        assert validate_hardware(events, mmc) is True
+
     def test_multiple_groups_searched(self):
         """Config can be in any group — not just 'Channel'."""
-        mmc = FakeMMCore(config_groups={
+        mmc = _core(config_groups={
             "Channel": ["phase-contrast"],
             "Laser": ["488nm", "561nm"],
         })
@@ -174,7 +84,7 @@ class TestChannelConfigExistence:
 
     def test_all_channels_checked(self):
         """All unique channel names across events are checked."""
-        mmc = FakeMMCore()
+        mmc = _core()
         events = [
             RTMEvent(index={"t": 0, "p": 0}, channels=(Channel("phase-contrast", 50),)),
             RTMEvent(index={"t": 1, "p": 0}, channels=(Channel("DAPI", 30),)),
@@ -200,12 +110,12 @@ class TestChannelConfigExistence:
 class TestExposureLimits:
 
     def test_exposure_within_range_passes(self):
-        mmc = FakeMMCore(property_limits={("Camera", "Exposure"): (0.0, 100.0)})
+        mmc = _core(property_limits={("Camera", "Exposure"): (0.0, 100.0)})
         events = _make_events(channels=[Channel("phase-contrast", 50)])
         assert validate_hardware(events, mmc) is True
 
     def test_exposure_exceeds_max_fails(self):
-        mmc = FakeMMCore(property_limits={("Camera", "Exposure"): (0.0, 100.0)})
+        mmc = _core(property_limits={("Camera", "Exposure"): (0.0, 100.0)})
         events = _make_events(channels=[Channel("phase-contrast", 200)])
 
         with warnings.catch_warnings(record=True) as w:
@@ -217,7 +127,7 @@ class TestExposureLimits:
         assert any("200" in str(x.message) for x in w)
 
     def test_exposure_below_min_fails(self):
-        mmc = FakeMMCore(property_limits={("Camera", "Exposure"): (5.0, 100.0)})
+        mmc = _core(property_limits={("Camera", "Exposure"): (5.0, 100.0)})
         events = _make_events(channels=[Channel("phase-contrast", 1)])
 
         with warnings.catch_warnings(record=True) as w:
@@ -229,12 +139,12 @@ class TestExposureLimits:
 
     def test_no_exposure_limits_skips_check(self):
         """When camera has no exposure limits, any value passes."""
-        mmc = FakeMMCore()  # no property_limits
+        mmc = _core()  # no property_limits
         events = _make_events(channels=[Channel("phase-contrast", 99999)])
         assert validate_hardware(events, mmc) is True
 
     def test_stim_channel_exposure_also_checked(self):
-        mmc = FakeMMCore(property_limits={("Camera", "Exposure"): (0.0, 100.0)})
+        mmc = _core(property_limits={("Camera", "Exposure"): (0.0, 100.0)})
         events = _make_events(
             channels=[Channel("phase-contrast", 50)],
             stim_channels=[Channel("phase-contrast", 500)],
@@ -249,7 +159,7 @@ class TestExposureLimits:
 
     def test_duplicate_exposures_not_repeated(self):
         """Same (name, exposure) across events should produce at most one warning."""
-        mmc = FakeMMCore(property_limits={("Camera", "Exposure"): (0.0, 100.0)})
+        mmc = _core(property_limits={("Camera", "Exposure"): (0.0, 100.0)})
         events = _make_events(channels=[Channel("phase-contrast", 200)], n=10)
 
         with warnings.catch_warnings(record=True) as w:
@@ -267,7 +177,7 @@ class TestExposureLimits:
 class TestDevicePropertyLimits:
 
     def test_power_within_range_passes(self):
-        mmc = FakeMMCore(property_limits={("LED", "Intensity"): (0.0, 100.0)})
+        mmc = _core(property_limits={("LED", "Intensity"): (0.0, 100.0)})
         power_props = {"phase-contrast": ("LED", "Intensity")}
         events = _make_events(
             channels=[PowerChannel("phase-contrast", 50, power=50)],
@@ -275,7 +185,7 @@ class TestDevicePropertyLimits:
         assert validate_hardware(events, mmc, power_properties=power_props) is True
 
     def test_power_exceeds_max_fails(self):
-        mmc = FakeMMCore(property_limits={("LED", "Intensity"): (0.0, 100.0)})
+        mmc = _core(property_limits={("LED", "Intensity"): (0.0, 100.0)})
         power_props = {"phase-contrast": ("LED", "Intensity")}
         events = _make_events(
             channels=[PowerChannel("phase-contrast", 50, power=150)],
@@ -289,7 +199,7 @@ class TestDevicePropertyLimits:
         assert any("exceeds device maximum" in str(x.message) for x in w)
 
     def test_power_below_min_fails(self):
-        mmc = FakeMMCore(property_limits={("LED", "Intensity"): (10.0, 100.0)})
+        mmc = _core(property_limits={("LED", "Intensity"): (10.0, 100.0)})
         power_props = {"phase-contrast": ("LED", "Intensity")}
         events = _make_events(
             channels=[PowerChannel("phase-contrast", 50, power=5)],
@@ -304,7 +214,7 @@ class TestDevicePropertyLimits:
 
     def test_no_device_limits_skips_check(self):
         """When device has no limits for the property, any value passes."""
-        mmc = FakeMMCore()  # no property_limits
+        mmc = _core()  # no property_limits
         power_props = {"phase-contrast": ("LED", "Intensity")}
         events = _make_events(
             channels=[PowerChannel("phase-contrast", 50, power=9999)],
@@ -313,12 +223,12 @@ class TestDevicePropertyLimits:
 
     def test_channel_without_power_skips_check(self):
         """Channels without power skip the property check."""
-        mmc = FakeMMCore(property_limits={("LED", "Intensity"): (0.0, 100.0)})
+        mmc = _core(property_limits={("LED", "Intensity"): (0.0, 100.0)})
         events = _make_events(channels=[Channel("phase-contrast", 50)])
         assert validate_hardware(events, mmc) is True
 
     def test_stim_channel_power_checked(self):
-        mmc = FakeMMCore(property_limits={("LED", "Intensity"): (0.0, 100.0)})
+        mmc = _core(property_limits={("LED", "Intensity"): (0.0, 100.0)})
         power_props = {"phase-contrast": ("LED", "Intensity")}
         events = _make_events(
             channels=[Channel("phase-contrast", 50)],
@@ -340,7 +250,7 @@ class TestDevicePropertyLimits:
 class TestCombinedHardwareValidation:
 
     def test_all_good_passes(self):
-        mmc = FakeMMCore(property_limits={
+        mmc = _core(property_limits={
             ("Camera", "Exposure"): (0.0, 100.0),
             ("LED", "Intensity"): (0.0, 100.0),
         })
@@ -352,7 +262,7 @@ class TestCombinedHardwareValidation:
 
     def test_multiple_problems_all_reported(self):
         """Bad config + bad exposure + bad power → three warnings."""
-        mmc = FakeMMCore(property_limits={
+        mmc = _core(property_limits={
             ("Camera", "Exposure"): (0.0, 100.0),
             ("LED", "Intensity"): (0.0, 50.0),
         })
@@ -372,7 +282,7 @@ class TestCombinedHardwareValidation:
         assert "exceeds device maximum" in messages  # power check
 
     def test_empty_events_passes(self):
-        mmc = FakeMMCore()
+        mmc = _core()
         assert validate_hardware([], mmc) is True
 
 
@@ -384,14 +294,14 @@ class TestAbstractMicroscopeValidateHardware:
     """AbstractMicroscope.validate_hardware is a no-op (returns True)."""
 
     def test_base_validate_hardware_returns_true(self):
-        from rtm_pymmcore.microscope.base import AbstractMicroscope
+        from faro.microscope.base import AbstractMicroscope
         mic = AbstractMicroscope()
         events = _make_events(channels=[Channel("anything", 50)])
         assert mic.validate_hardware(events) is True
 
     def test_base_validate_hardware_without_pipeline(self):
         """validate_hardware works standalone (no pipeline involved)."""
-        from rtm_pymmcore.microscope.base import AbstractMicroscope
+        from faro.microscope.base import AbstractMicroscope
         mic = AbstractMicroscope()
         events = _make_events(channels=[Channel("anything", 50)])
         assert mic.validate_hardware(events) is True
@@ -401,22 +311,22 @@ class TestPyMMCoreMicroscopeValidateHardware:
     """PyMMCoreMicroscope.validate_hardware delegates to utils.validate_hardware."""
 
     def test_no_mmc_returns_true(self):
-        from rtm_pymmcore.microscope.pymmcore import PyMMCoreMicroscope
+        from faro.microscope.pymmcore import PyMMCoreMicroscope
         mic = PyMMCoreMicroscope()
         events = _make_events(channels=[Channel("anything", 50)])
         assert mic.validate_hardware(events) is True
 
     def test_delegates_to_utils(self):
-        from rtm_pymmcore.microscope.pymmcore import PyMMCoreMicroscope
+        from faro.microscope.pymmcore import PyMMCoreMicroscope
         mic = PyMMCoreMicroscope()
-        mic.mmc = FakeMMCore()
+        mic.mmc = _core()
         events = _make_events(channels=[Channel("phase-contrast", 50)])
         assert mic.validate_hardware(events) is True
 
     def test_delegates_detects_bad_channel(self):
-        from rtm_pymmcore.microscope.pymmcore import PyMMCoreMicroscope
+        from faro.microscope.pymmcore import PyMMCoreMicroscope
         mic = PyMMCoreMicroscope()
-        mic.mmc = FakeMMCore()
+        mic.mmc = _core()
         events = _make_events(channels=[Channel("MISSING", 50)])
 
         with warnings.catch_warnings(record=True) as w:
@@ -429,12 +339,12 @@ class TestPyMMCoreMicroscopeValidateHardware:
     def test_pipeline_and_hardware_validation_separate(self):
         """pipeline.validate_pipeline + mic.validate_hardware work independently."""
         import tempfile, shutil
-        from rtm_pymmcore.microscope.pymmcore import PyMMCoreMicroscope
-        from rtm_pymmcore.core.pipeline import ImageProcessingPipeline
-        from rtm_pymmcore.core.data_structures import SegmentationMethod, RTMSequence
+        from faro.microscope.pymmcore import PyMMCoreMicroscope
+        from faro.core.pipeline import ImageProcessingPipeline
+        from faro.core.data_structures import SegmentationMethod, RTMSequence
 
         # Minimal segmentator for pipeline
-        from rtm_pymmcore.segmentation.base import Segmentator
+        from faro.segmentation.base import Segmentator
         import numpy as np
 
         class DummySeg(Segmentator):
@@ -448,7 +358,7 @@ class TestPyMMCoreMicroscopeValidateHardware:
                 segmentators=[SegmentationMethod("labels", DummySeg(), 0, False)],
             )
             mic = PyMMCoreMicroscope()
-            mic.mmc = FakeMMCore()
+            mic.mmc = _core()
 
             # Valid events — both pass
             events = _make_events(channels=[Channel("phase-contrast", 50)])
