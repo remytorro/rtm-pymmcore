@@ -1,29 +1,28 @@
-# rtm-pymmcore
+# FARO: Real-time feedback control microscopy for automation of optogenetic targeting
+**FARO** (**F**eedback **A**daptive **R**eal-time **O**ptogenetics, also *lighthouse* in Spanish) acquires images, segments cells, extracts features, tracks them over time, and generates stimulation masks, all while the experiment is running. This enables closed-loop feedback control: stimulation patterns can be computed from the latest segmentation and applied within the same or next timepoint.
 
-**Real-time feedback control microscopy.**
-
-rtm-pymmcore acquires images, segments cells, extracts features, tracks them over time, and generates stimulation masks, all while the experiment is running. This enables closed-loop feedback control: stimulation patterns can be computed from the latest segmentation and applied within the same or next timepoint.
+![FARO abstract](docs/assets/abstract.png)
 
 ## Architecture
 
 ```
-Pipeline   ◀──▶  Controller   ◀──▶   Microscope
-────────         ──────────          ──────────
+Pipeline   <-->  Controller   <-->   Microscope
+--------         ----------          ----------
 - segment        - orchestrate       - stage
 - track            experiment        - camera
 - extract                            - DMD/SLM
   features                           - live cells
-- stim mask                           
+- stim mask
 ```
-**Microscope**: hardware interface. Any microscope that speaks implements [useq-schema](https://github.com/pymmcore-plus/useq-schema) can be used. Works great with µManger / [pymmcore-plus](https://github.com/pymmcore-plus/pymmcore-plus).
+**Microscope**: hardware interface. Any microscope that implements [useq-schema](https://github.com/pymmcore-plus/useq-schema) can be used. Works great with Micro-Manager / [pymmcore-plus](https://github.com/pymmcore-plus/pymmcore-plus).
 
 **Pipeline**: modular image processing. Performs segmentation, tracking, feature extraction. Decides if/where to photoactivate the sample.
 
-**Controller**: experiment orchestrator. Queues acquisition events to the microscope, dispatches frames to the pipeline, and coordinates stimulation timing.
+**Controller**: experiment orchestrator. Queues acquisition events to the microscope, dispatches frames to the pipeline, and coordinates stimulation timing. A simulated controller (`ControllerSimulated`) can replay pre-acquired data from disk for testing or re-analysis.
 
 ## Quickstart
 
-Try **`experiments/demo_sim_optogenetic/`** notebook to run a complete optogenetic feedback experiment on a simulated microscope, no hardware required.
+Try **`experiments/02_demo_sim_optogenetic/`** notebook to run a complete optogenetic feedback experiment on a simulated microscope, no hardware required.
 
 ```python
 # 1. Set microscope
@@ -50,7 +49,8 @@ events = RTMSequence(
 
 # 4. Run!
 ctrl = Controller(mic, pipeline)
-ctrl.run_experiment(list(events), stim_mode="current")
+handle = ctrl.run_experiment(list(events), stim_mode="current")
+handle.wait()  # run_experiment is non-blocking; wait() blocks until done
 ```
 
 ## Pipeline
@@ -62,7 +62,7 @@ The pipeline is modular, each component is independent and can be swapped or set
 | **Segmentation** | Identify cells in images | `OtsuSegmentator`, `SegmentorCellpose`, `SegmentatorStardist`, remote via [imaging-server-kit](https://github.com/imaging-server-kit) |
 | **Stimulation** | Generate masks for DMD/SLM | `StimWholeFOV`, `StimPercentageOfCell`, `CenterCircle`, `StimLine` |
 | **Feature extraction** | Measure cell properties | `SimpleFE` (position, area), `FE_ErkKtr` (ERK-KTR c/n ratio) |
-| **Tracking** | Link cells across frames | `TrackerTrackpy` (via [trackpy](https://github.com/soft-matter/trackpy)) |
+| **Tracking** | Link cells across frames | `TrackerTrackpy` (via [trackpy](https://github.com/soft-matter/trackpy)), `TrackerMotile` (ILP via [motile](https://github.com/funkelab/motile), supports divisions/merges) |
 
 ```python
 pipeline = ImageProcessingPipeline(
@@ -80,24 +80,65 @@ The Controller converts RTMEvents to MDAEvents, queues them through the microsco
 
 ### Experiment Definition
 
-Experiments are defined as `RTMSequence` objects — an extension of useq's `MDASequence`. Multiple phases can be concatenated with `+`:
+Experiments are defined as `RTMSequence` objects — an extension of useq's `MDASequence`. Compose multi-step experiments with `combine()`, which supports two modes of composition via the `axis` argument:
 
 ```python
-from rtm_pymmcore.core.data_structures import Channel, PowerChannel, RTMSequence
+from faro.core.data_structures import Channel, PowerChannel, RTMSequence, combine
+```
 
-phase_1 = RTMSequence(
+**Sequential phases (`axis="t"`).** Each phase runs after the previous one, same positions, with `t` indices and wall-clock times offset automatically:
+
+```python
+baseline = RTMSequence(
     time_plan={"interval": 60.0, "loops": 100},
     stage_positions=fov_positions,
     channels=[{"config": "miRFP", "exposure": 300}],
 )
-
-phase_2 = RTMSequence(
+treatment = RTMSequence(
     time_plan={"interval": 60.0, "loops": 150},
     stage_positions=fov_positions,
     channels=[{"config": "miRFP", "exposure": 300}],
 )
+washout = RTMSequence(...)
 
-events = phase_1 + phase_2
+events = combine(baseline, treatment, washout, axis="t")
+```
+
+**Parallel sub-experiments (`axis="p"`).** Two (or more) setups running concurrently on different subsets of FOVs — useful when FOVs need different stim patterns, different stim schedules, or different treatment metadata, but should share the clock. Each sub-experiment keeps its own `stim_frames` and `rtm_metadata`:
+
+```python
+setup_a = RTMSequence(
+    time_plan={"interval": 10.0, "loops": 100},
+    stage_positions=fovs_1_to_5,
+    channels=[{"config": "miRFP", "exposure": 300}],
+    stim_channels=(stim_pattern_a,),
+    stim_frames={10, 20, 30},
+    rtm_metadata={"treatment": "DMSO"},
+)
+setup_b = RTMSequence(
+    time_plan={"interval": 10.0, "loops": 100},
+    stage_positions=fovs_6_to_10,
+    channels=[{"config": "miRFP", "exposure": 300}],  # must match setup_a
+    stim_channels=(stim_pattern_b,),
+    stim_frames={15, 25, 35},
+    rtm_metadata={"treatment": "drug"},
+)
+
+events = combine(setup_a, setup_b, axis="p")
+# At each timepoint: FOVs 0-4 image with setup_a's stim schedule,
+# FOVs 5-9 image with setup_b's — all in parallel on the same clock.
+```
+
+**Precondition for `axis="p"`:** all sub-experiments must declare the same imaging channels. The writer allocates a single channel set across all positions, so heterogeneous channels per FOV are not supported today (tracked for the eventual useq-schema v2 migration). A `ValueError` is raised at call time if channel configs differ.
+
+`combine()` is variadic (`combine(a, b, c, d, ..., axis=...)`), handles the N=0 and N=1 degenerate cases, and is the only composition primitive — there is deliberately no shorthand operator, so every multi-step experiment reads the composition axis explicitly.
+
+**Timed waits between phases.** `wait(seconds)` inserts a fixed-duration pause — e.g. to let cells recover before stimulating. It acquires no frames and just delays everything after it:
+
+```python
+from faro.core.data_structures import wait
+
+events = combine(baseline, wait(60), stim_phase, axis="t")
 ```
 
 ### Stimulation
@@ -132,7 +173,7 @@ seq = RTMSequence(
 )
 ```
 
-Alternatively, define the reference as a separate phase:
+Alternatively, define the reference as a separate phase and chain it with `combine`:
 
 ```python
 experiment = RTMSequence(time_plan=..., channels=..., ...)
@@ -142,7 +183,7 @@ ref_phase  = RTMSequence(
     channels=[{"config": "mCitrine", "exposure": 600}],
     rtm_metadata={"img_type": ImgType.IMG_REF},
 )
-events = experiment + ref_phase
+events = combine(experiment, ref_phase, axis="t")
 ```
 
 ### Frame Specification
@@ -179,16 +220,48 @@ seq = RTMSequence(
 
 Stimulation and reference channels are assigned per-timepoint, so they work correctly regardless of axis order. For example, `stim_frames={3}` stimulates all positions at t=3, whether they are visited consecutively (`tpcz`) or spread across the run (`ptcz`).
 
+### FOV Batching
+
+When an experiment has more FOV positions than can be imaged within a single timepoint interval, FOV batching automatically partitions positions into sequential batches with adjusted timing.
+
+```python
+from faro.core.utils import check_fov_batching, apply_fov_batching
+
+events = list(seq)
+
+# Check whether all FOVs fit in one batch
+check_fov_batching(events, time_per_fov=2.0)
+
+# If not, split into batches with adjusted timing
+events = apply_fov_batching(events, time_per_fov=2.0)
+```
+
+`check_fov_batching` computes how many FOVs fit in parallel (`interval / time_per_fov`) and reports whether batching is needed. `apply_fov_batching` offsets overflow FOVs into subsequent batches so that each batch runs within the interval. Timepoint indices are adjusted so the imaging order remains physically sensible.
+
 ### Running
 
 ```python
-from rtm_pymmcore.core.controller import Controller
+from faro.core.controller import Controller
 
 ctrl = Controller(mic, pipeline)
-ctrl.run_experiment(events, stim_mode="current")
+handle = ctrl.run_experiment(events, stim_mode="current")
+handle.wait()  # block until the run finishes
 ```
 
 `validate_events()` runs automatically before the experiment starts (disable with `validate=False`). It checks both pipeline compatibility and hardware limits.
+
+`run_experiment()` and `continue_experiment()` are **non-blocking** — they return a `RunHandle` so the kernel stays free (e.g. to use the napari viewer). Call `handle.wait()` to block until the run finishes.
+
+```python
+handle = ctrl.run_experiment(events, stim_mode="current")
+handle.pause(); handle.resume()   # stop/resume acquiring; schedule is preserved
+handle.cancel()                   # graceful stop
+handle.wait()                     # block until done
+
+# Live status badge, progress strip, and Pause/Stop buttons in napari:
+from faro.widgets import ExperimentStatusWidget
+viewer.window.add_dock_widget(ExperimentStatusWidget(ctrl), area="right")
+```
 
 ### Experiment Continuation
 
@@ -199,7 +272,7 @@ ctrl = Controller(mic, pipeline)
 
 # Phase 1: baseline — find cells, measure growth rate
 phase1 = RTMSequence(time_plan={"interval": 10, "loops": 60}, ...)
-ctrl.run_experiment(phase1, validate=False)
+ctrl.run_experiment(phase1, validate=False).wait()  # wait() before reading results
 
 # Analyse phase-1 results to decide what to do next
 df = pd.read_parquet("tracks/000_latest.parquet")
@@ -207,7 +280,7 @@ fast_growers = df.groupby("particle")["area"].apply(lambda x: x.diff().mean())
 
 # Phase 2: stimulate based on analysis
 phase2 = RTMSequence(time_plan={"interval": 10, "loops": 120}, ...)
-ctrl.continue_experiment(phase2)
+ctrl.continue_experiment(phase2).wait()
 
 # Always call finish_experiment() when done
 ctrl.finish_experiment()
@@ -220,12 +293,191 @@ ctrl.run_experiment(baseline_events, validate=False)  # runs in background threa
 ctrl.extend_experiment(extra_events)                   # non-blocking, appends to running acquisition
 ```
 
-| Method | When to use |
-|--------|-------------|
-| `run_experiment()` | First acquisition — creates a fresh Analyzer |
-| `continue_experiment()` | Subsequent phases — reuses Analyzer, offsets timesteps |
-| `extend_experiment()` | Mid-run additions — pushes events into the running loop |
-| `finish_experiment()` | Cleanup — shuts down Analyzer, resets state |
+| Method | When to use | Returns |
+|--------|-------------|---------|
+| `run_experiment()` | First acquisition — creates a fresh Analyzer | `RunHandle` (non-blocking) |
+| `continue_experiment()` | Subsequent phases — reuses Analyzer, offsets timesteps | `RunHandle` (non-blocking) |
+| `extend_experiment()` | Mid-run additions — pushes events into the running loop | — (non-blocking) |
+| `finish_experiment()` | Cleanup — shuts down Analyzer, resets state | — (blocks until drained) |
+
+## Simulated Controller
+
+`ControllerSimulated` loads pre-acquired images from disk instead of from the camera, enabling testing and re-analysis without hardware.
+
+It supports both **TIFF** (`raw/`, `ref/` folders) and **OME-Zarr** (`acquisition.ome.zarr`) source layouts. When an OME-Zarr store is found, raw frames are read from zarr; reference images fall back to TIFFs in `ref/`.
+
+```python
+from faro.core.controller import ControllerSimulated
+
+ctrl = ControllerSimulated(mic, pipeline, old_data_project_path="/path/to/old_experiment")
+ctrl.run_experiment(events, stim_mode="current").wait()
+```
+
+Use cases:
+- **Testing**: run the full pipeline on demo data without any microscope hardware
+- **Re-analysis**: replay raw images through a new pipeline (different segmentation, tracking, etc.)
+- **Validation**: verify analysis logic reproducibly on known data
+
+See **`experiments/11_erk_experiments_full_fov_stim/stim_rtmsequence_demo_mic.ipynb`** for a working example.
+
+## Re-analysis
+
+The offline re-analysis pipeline (`ImageProcessingPipeline_postExperiment`) reprocesses images from a previous experiment with new segmentation, tracking, or feature extraction parameters — without re-acquiring.
+
+```python
+from faro.core.pipeline_post import ImageProcessingPipeline_postExperiment
+
+pipeline = ImageProcessingPipeline_postExperiment(
+    img_storage_path="/path/to/original_experiment",
+    out_path="/path/to/new_output",
+    events=events,
+    segmentators=[SegmentationMethod("labels", SegmentorCellpose(), use_channel=0)],
+    feature_extractor=FE_ErkKtr("labels"),
+    tracker=TrackerTrackpy(),
+    n_jobs=4,
+)
+pipeline.run()
+```
+
+Key features:
+- **Dual input format**: reads from both TIFF and OME-Zarr source experiments
+- **Reuse old segmentations**: set `use_old_segmentations=True` to skip re-segmenting and only recompute tracking/features
+- **Parallel FOV processing**: uses `n_jobs` threads to process multiple FOVs concurrently
+- **Hard-linking**: when outputting to OME-Zarr, raw data resolution levels are hard-linked instead of copied (falls back to copy on network shares)
+- **Timestep gap correction**: `correct_timestep_jumps=True` backfills missing timesteps
+
+See **`experiments/90_reanalysis/reanalysis.ipynb`** for a complete example.
+
+## Storage
+
+The pipeline writes acquired images, segmentation masks, and stimulation masks to disk. Three writer backends are available:
+
+| Writer | Format | Best for |
+|--------|--------|----------|
+| `TiffWriter` | Individual TIFF files | Quick inspection, legacy compatibility |
+| `OmeZarrWriter` | OME-Zarr v0.5 | Streaming acquisition, cloud-friendly, single multi-dimensional array |
+| `OmeZarrWriterPlate` | OME-Zarr v0.5 (plate layout) | Multi-position experiments viewed as a spatial mosaic |
+
+### OmeZarrWriter (default)
+
+
+Streams all data into a single OME-Zarr v0.5 store. Raw images are stored as a single multi-dimensional array (t, c, y, x) for single-position experiments or (t, p, c, y, x) for multi-position experiments. Segmentation labels are stored as NGFF label groups.
+
+```
+experiment/
+├── acquisition.ome.zarr/
+│   ├── 0/                  raw data array
+│   └── labels/
+│       ├── labels/         segmentation masks
+│       └── stim_mask/      stimulation masks
+└── tracks/                 parquet files
+```
+
+```python
+from faro.core.writers import OmeZarrWriter
+
+writer = OmeZarrWriter(
+    storage_path="/path/to/experiment",
+    dtype="uint16",
+    store_stim_images=False,       # True: include stim channels in raw array
+    n_timepoints=None,             # None = unbounded (resizable)
+    raw_chunk_t=1,                 # temporal chunk size for raw data
+    label_shard_t=50,              # temporal shard size for labels
+)
+
+pipeline = ImageProcessingPipeline(
+    storage_path="/path/to/experiment",
+    writer=writer,
+    ...
+)
+```
+
+The stream is initialized automatically by the Controller before the first frame is written — no manual setup required.
+
+### OmeZarrWriterPlate (plate layout)
+
+Stores each FOV position as a separate well in an OME-Zarr plate. When opened in napari with `napari-ome-zarr`, positions are tiled spatially as a mosaic rather than stacked along a position slider. This makes it easy to get an overview of all positions at once.
+
+```
+experiment/
+├── acquisition.ome.zarr/
+│   ├── A/
+│   │   ├── 1/             well for position 0
+│   │   │   └── 0/         image group (t, c, y, x)
+│   │   ├── 2/             well for position 1
+│   │   └── ...
+└── tracks/
+```
+
+```python
+from faro.core.writers import OmeZarrWriterPlate
+
+writer = OmeZarrWriterPlate(
+    storage_path="/path/to/experiment",
+    dtype="uint16",
+)
+
+pipeline = ImageProcessingPipeline(
+    storage_path="/path/to/experiment",
+    writer=writer,
+    ...
+)
+```
+
+### TiffWriter
+Saves each frame as a separate compressed TIFF file:
+
+```
+experiment/
+├── raw/          000_000.tiff, 000_001.tiff, ...
+├── labels/       000_000.tiff, ...
+├── stim_mask/    ...
+└── tracks/       000_latest.parquet, ...
+```
+
+```python
+from faro.core.writers import TiffWriter
+
+pipeline = ImageProcessingPipeline(
+    storage_path="/path/to/experiment",
+    writer=TiffWriter("/path/to/experiment"),
+    ...
+)
+```
+
+
+### Viewing OME-Zarr Data
+
+OME-Zarr files can be viewed with [napari](https://napari.org) using the [napari-ome-zarr](https://github.com/ome/napari-ome-zarr) plugin. The easiest way to install napari as a standalone tool is with `uv tool`:
+
+```bash
+uv tool install napari[pyqt6] --with napari-ome-zarr
+```
+
+This makes `napari` available as a global command. Open an OME-Zarr dataset directly from the terminal:
+
+```bash
+napari /path/to/experiment/acquisition.ome.zarr
+```
+
+You can also create a desktop shortcut pointing to the `napari` executable for quick access. To find its location:
+
+```bash
+uv tool dir
+```
+
+### Converting TIFF to OME-Zarr
+
+Existing TIFF-based experiments can be migrated to OME-Zarr using the conversion utility:
+
+```python
+from faro.core.conversion import convert_tiff_to_omezarr
+
+convert_tiff_to_omezarr(
+    src_path="/path/to/tiff_experiment",
+    dst_path="/path/to/omezarr_experiment",
+)
+```
 
 ## Microscope
 
@@ -274,17 +526,17 @@ For microscopes with controllable light source power, define a `POWER_PROPERTIES
 
 ```python
 POWER_PROPERTIES = {
-    "CyanStim": ("Spectra", "Cyan_Level"),  # config_name → (device, property)
+    "CyanStim": ("Spectra", "Cyan_Level"),  # config_name -> (device, property)
 }
 ```
 
-## Adding Your Own µManager Microscope
+## Adding Your Own Micro-Manager Microscope
 
-Create a new file in `rtm_pymmcore/microscope/` and inherit from `PyMMCoreMicroscope`:
+Create a new file in `faro/microscope/` and inherit from `PyMMCoreMicroscope`:
 
 ```python
 import pymmcore_plus
-from rtm_pymmcore.microscope.pymmcore import PyMMCoreMicroscope
+from faro.microscope.pymmcore import PyMMCoreMicroscope
 
 class MyScope(PyMMCoreMicroscope):
     MICROMANAGER_PATH = "C:\\Program Files\\Micro-Manager-2.0"
@@ -309,10 +561,38 @@ For DMD support, set up `self.dmd` in `__init__()`, see `pertzlab/moench.py` for
 
 ## Installation
 
+This project uses [uv](https://docs.astral.sh/uv/) for dependency management.
+
 ```bash
-git clone https://github.com/pertzlab/rtm-pymmcore.git
-cd rtm-pymmcore
-pip install -r requirements.txt
+git clone https://github.com/pertzlab/faro.git
+cd faro
+uv sync
+```
+
+### Extras
+
+Optional dependency groups are available for segmentation backends and simulation:
+
+| Extra | Packages | Use case |
+|-------|----------|----------|
+| `cellpose` | cellpose, torch | Cellpose segmentation |
+| `stardist` | stardist, tensorflow, csbdeep | StarDist segmentation |
+| `convpaint` | napari-convpaint, scipy | ConvPaint segmentation |
+| `virtual_microscope` | virtual-microscope | Fully simulated microscope with synthetic cell images. For a quick demo, the built-in Micro-Manager demo adapter works without this extra. |
+
+Install one or more extras with `uv sync`:
+
+```bash
+uv sync --extra cellpose
+uv sync --extra cellpose --extra stardist
+uv sync --extra virtual_microscope
+```
+
+Alternatively, with pip (installs the package with all its dependencies):
+
+```bash
+pip install ".[cellpose]"
+pip install ".[cellpose,stardist]"
 ```
 
 ## Contributing

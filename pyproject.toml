@@ -1,7 +1,7 @@
 [project]
-name = "rtm-pymmcore"
+name = "faro"
 version = "1.0.0"
-description = "Real-time feedback control microscopy using pymmcore as interface "
+description = "FARO - Feedback Adaptive Real-time Optogenetics"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -18,13 +18,26 @@ dependencies = [
     "pymmcore-widgets",
     "trackpy",
     "napari-micromanager",
-    "imaging-server-kit",
+    "pymmcore-widgets",
+    "ome-writers",
+    "napari-ome-zarr",
+    "zarr>=3",
 ]
 
 [project.optional-dependencies]
-ome_zarr = [
-    "ome-zarr",
-    ]
+
+test = [
+    "pytest",
+    "pytest-xdist",
+    # The suite exercises both tracking backends; motile is the non-default
+    # one (trackpy is a core dep).
+    "faro[motile]",
+    "nbformat",
+]
+
+motile = [
+    "motile",
+]
 
 stardist = [
     "stardist",
@@ -33,8 +46,18 @@ stardist = [
     ]
 
 cellpose = [
-    "cellpose",
+    # 4.1.1 fixed a numpy 2.x crash in models._resize_gradients on the
+    # GPU code path. Older versions are fine on CPU but blow up on GPU.
+    "cellpose>=4.1.1",
     "torch",
+    # torchvision is a transitive dep of cellpose, but listed explicitly
+    # so [tool.uv.sources] picks up the cu128 index pin (uv only routes
+    # source overrides for packages declared as direct deps).
+    "torchvision",
+    # cellpose imports cv2 but doesn't pin opencv itself; declare it here
+    # so the cellpose extra is self-sufficient (was only pulled in
+    # transitively via the virtual-microscope extra before).
+    "opencv-python",
     ]
 
 convpaint = [
@@ -42,18 +65,55 @@ convpaint = [
     "scipy"
 ]
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[tool.uv.sources]
-torch = [
-  { index = "pytorch-cu128", extra = "cellpose" },
+remote-segmentation = [
+    "imaging-server-kit",
 ]
-napari-micromanager = { git = "https://github.com/pymmcore-plus/napari-micromanager" }
+
+
+virtual-microscope = [
+    "virtual-microscope",
+    "opencv-python",
+    "imageio[ffmpeg]"
+]
+
+api74 = [
+    "pymmcore==11.10.0.74.1"
+]
+
+api75 = [
+    "pymmcore==12.2.2.75.0"
+]
 
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+# CUDA 13.0 wheels. Requires NVIDIA driver >= 580.65.
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "api74" },
+        { extra = "api75" },
+    ],
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+virtual-microscope = { git = "https://github.com/hinderling/virtual-microscope.git" }
+pymmcore-widgets = {git = "https://github.com/pymmcore-plus/pymmcore-widgets.git" }
+# PyPI napari-micromanager is 0.2.0 (no MainWindow(mmcore=...) and predates
+# the async-relevant fixes: _image_snapped race, device-leak teardown,
+# preview-during-run). Track upstream main like the other faro envs.
+napari-micromanager = { git = "https://github.com/pymmcore-plus/napari-micromanager.git", branch = "main" }
+
+[tool.pytest.ini_options]
+markers = [
+    "hardware: requires a real Pertzlab microscope (selected via --scope or FARO_SCOPE env var). Skipped by default.",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
