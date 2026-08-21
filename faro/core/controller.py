@@ -1654,7 +1654,10 @@ class Controller:
             print("Warning: Stimulation mask unavailable, sending False to SLM.")
             stim_mask = False
         elif isinstance(stim_mask, np.ndarray):
-            stim_mask = self._mic.dmd.affine_transform(stim_mask)
+            # The microscope decides how a camera-space mask reaches its
+            # illuminator: a DMD warps it here, a FRAP galvo takes camera
+            # pixels and transforms them in firmware.
+            stim_mask = self._mic.prepare_stim_mask(stim_mask)
 
         return SLMImage(
             data=stim_mask, device=self._mic.dmd.name, exposure=stim_ch.exposure

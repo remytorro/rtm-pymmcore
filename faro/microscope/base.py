@@ -74,6 +74,21 @@ class AbstractMicroscope:
         """Return (device, property, power) or None. Optional override."""
         return None
 
+    def prepare_stim_mask(self, mask: np.ndarray) -> np.ndarray:
+        """Map a camera-space stim *mask* into the stim device's own space.
+
+        The pipeline always produces masks in **camera** pixels, because that is
+        where segmentation happened. Getting them to the illuminator is
+        device-specific, so the microscope owns it: a DMD needs the calibrated
+        camera->DMD affine applied here, while a device that does its own
+        coordinate transform downstream must receive camera pixels untouched.
+
+        Overriding this is the supported way to opt out of the DMD warp — doing
+        it by leaving the DMD uncalibrated works only by accident, and breaks
+        the moment somebody calibrates it.
+        """
+        return self.dmd.affine_transform(mask)
+
     # ------------------------------------------------------------------
     # Validation
     # ------------------------------------------------------------------
