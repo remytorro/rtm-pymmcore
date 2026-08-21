@@ -568,6 +568,19 @@ class InscoperMicroscope(AbstractMicroscope):
             return mask
         return super().prepare_stim_mask(mask)
 
+    @property
+    def uses_dmd_affine(self) -> bool:
+        """False when the FRAP galvo is the stim device.
+
+        Mirrors the :meth:`prepare_stim_mask` opt-out above: with FRAP as the
+        stim device the DMD affine is never applied, so ``run_experiment``'s
+        pre-flight must not demand ``calibrate_dmd()`` — running it here is
+        exactly what would aim the beam wrong.
+        """
+        if getattr(self.mmc, "use_frap_as_slm", False):
+            return False
+        return super().uses_dmd_affine
+
     # ------------------------------------------------------------------
     # Live napari viewer
     # ------------------------------------------------------------------

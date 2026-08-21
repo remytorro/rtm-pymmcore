@@ -89,6 +89,18 @@ class AbstractMicroscope:
         """
         return self.dmd.affine_transform(mask)
 
+    @property
+    def uses_dmd_affine(self) -> bool:
+        """Whether stim masks go through the DMD's camera->DMD affine.
+
+        ``True`` for a real DMD, which needs :meth:`calibrate_dmd` before it
+        can aim. Subclasses that override :meth:`prepare_stim_mask` to bypass
+        the warp (e.g. a FRAP galvo whose firmware applies its own
+        calibration) return ``False`` so the calibration check below does not
+        demand a calibration their light path never reads.
+        """
+        return True
+
     # ------------------------------------------------------------------
     # Validation
     # ------------------------------------------------------------------
@@ -105,13 +117,16 @@ class AbstractMicroscope:
     def _validate_dmd_calibration(self, events) -> bool:
         """Warn if events contain stim but the DMD isn't calibrated.
 
-        Skipped when the microscope has no DMD or the events have no
-        stim channels — non-DMD setups and non-stim experiments don't
+        Skipped when the microscope has no DMD, does not route masks
+        through the DMD affine (:attr:`uses_dmd_affine`), or the events
+        have no stim channels — non-DMD setups and non-stim experiments don't
         need it. Without this check, the failure surfaces deep in the
         first stim event as ``DMD.affine_transform`` raising
         ``ValueError("DMD not calibrated...")``.
         """
         if self.dmd is None:
+            return True
+        if not self.uses_dmd_affine:
             return True
         if getattr(self.dmd, "affine", None) is not None:
             return True
