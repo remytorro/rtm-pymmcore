@@ -190,4 +190,7 @@ cython_debug/
 tests/hardware/*/.preflight.json
 
 
-inscoper*
+# Inscoper node-locked licence file (per-machine, do not commit).
+# NB: this used to be a blanket `inscoper*`, which also swallowed
+# faro/microscope/Inscoper.py -- the adapter belongs in the repo.
+*.lic
