@@ -2,13 +2,12 @@ import skimage
 import numpy as np
 import numpy.typing as npt
 import matplotlib.pyplot as plt
-import time
 import scipy
 
 # from .acquisition import acq
 from pymmcore_plus import CMMCorePlus
 from useq import PropertyTuple
-from useq._mda_event import SLMImage
+from faro.core._useq_compat import SLMImage
 from useq import MDAEvent
 import random
 
@@ -23,19 +22,25 @@ class DMD:
     def __init__(
         self,
         mmc: CMMCorePlus,
-        calibration_profile,
+        resolve_power=None,
         affine_matrix=None,
         test_mode: bool = False,
     ):
         """Args:
         mmc: core object from CMMCorePlus()
+        resolve_power: callable(channel) -> (device, property, power) or None,
+            typically ``microscope.resolve_power``. Used by :meth:`calibrate`
+            to resolve the calibration channel's light-source power from the
+            microscope's ``POWER_PROPERTIES`` (rather than hardcoding the
+            device/property). If None (or it returns None) calibration carries
+            no power override and the line stays at its current level.
         test_mode: try the function without a DMD set up in uManager. Defaults to False.
         """
         # Load all dmd properties from micro-manager
         self.mmc = mmc
         self.test_mode = test_mode
         self.affine = None
-        self.calibration_profile = calibration_profile
+        self._resolve_power = resolve_power
 
         if affine_matrix is not None:
             self.affine = affine_matrix
@@ -50,6 +55,47 @@ class DMD:
                 np.uint8
             )
             self.sample_mask_off = np.zeros((self.height, self.width)).astype(np.uint8)
+            # The pattern shown during live view. The microscope's keep-alive
+            # loop re-displays this every refresh, so whatever all_on() /
+            # checker_board() / all_off() last set persists instead of being
+            # forced back to all-on.
+            self.livemode_image = self.all_on_img()
+
+    def _calibration_channel_dict(self, channel) -> dict:
+        """MDAEvent ``channel`` dict for the calibration *channel*."""
+        ch_dict = {"config": channel.config}
+        group = getattr(channel, "group", None)
+        if group:
+            ch_dict["group"] = group
+        return ch_dict
+
+    def _calibration_properties(self, channel, power=None):
+        """MDAEvent ``properties`` for the calibration *channel*, or None.
+
+        Resolves (device, property, power) via the microscope's
+        ``resolve_power`` so the device/property come from the single
+        ``POWER_PROPERTIES`` source of truth. ``power`` overrides the channel's
+        power (e.g. ``0`` to switch the line off after calibration).
+        """
+        if self._resolve_power is None:
+            return None
+        resolved = self._resolve_power(channel)
+        if resolved is None:
+            return None
+        device, prop, default_power = resolved
+        value = default_power if power is None else power
+        return [(device, prop, value)]
+
+    def _set_calibration_power(self, channel, power):
+        """Set the calibration line's power directly (no camera frame).
+
+        Used to switch the calibration light off when the routine finishes,
+        without running a throwaway blank capture.
+        """
+        props = self._calibration_properties(channel, power)
+        if props:
+            (device, prop, value), = props  # always exactly one: the LED power
+            self.mmc.setProperty(device, prop, value)
 
     def affine_transform(self, img):
         """Applies transformation matrix on image in camera space. Returns mask in dmd space.
@@ -94,15 +140,30 @@ class DMD:
             img_transformed = img_transformed * 255.0
         return img_transformed.astype(np.uint8)
 
-    def all_on(self):
-        """turn on projector all pixels for a long time"""
-        self.mmc.setSLMPixelsTo(self.name, 255)
+    def display_livemode(self):
+        """Display the current live-view pattern with a long SLM exposure.
+
+        Used by all_on / all_off / checker_board and by the microscope's
+        keep-alive loop, which calls this on every refresh so the pattern
+        chosen for live view stays put (rather than reverting to all-on).
+        """
+        self.mmc.setSLMExposure(self.name, 200000.0)
+        self.mmc.setSLMImage(self.name, self.livemode_image)
         self.mmc.displaySLMImage(self.name)
 
+    def all_on(self):
+        """Set the live-view DMD pattern to all-pixels-on (persists).
+
+        Use to return the DMD to full-open after a focus-check pattern such
+        as checker_board().
+        """
+        self.livemode_image = self.all_on_img()
+        self.display_livemode()
+
     def all_off(self):
-        """turn off pixels"""
-        self.mmc.setSLMPixelsTo(self.name, 0)
-        self.mmc.displaySLMImage(self.name)
+        """Set the live-view DMD pattern to all-pixels-off (persists)."""
+        self.livemode_image = np.zeros((self.height, self.width), dtype=np.uint8)
+        self.display_livemode()
 
     def all_on_img(self):
         """generate an image with all pixels on"""
@@ -110,14 +171,17 @@ class DMD:
         return all_on_image
 
     def checker_board(self, pixels=20):
-        """display a checkerboard pattern for a long time"""
-        # build checkerboard
+        """Set the live-view DMD pattern to a checkerboard (persists).
+
+        Handy for checking DMD focus during live view: the keep-alive loop
+        re-displays this pattern instead of reverting to all-on after a few
+        seconds.
+        """
         checker_board = (np.indices((self.height, self.width)) // pixels).sum(
             axis=0
         ) % 2
-        checker_board = checker_board.astype(np.uint8) * 255
-        self.mmc.setSLMImage(self.name, checker_board)
-        self.mmc.displaySLMImage(self.name)
+        self.livemode_image = checker_board.astype(np.uint8) * 255
+        self.display_livemode()
 
     def select_well_distributed_points(self, valid_pixels, n_points):
         """
@@ -178,8 +242,34 @@ class DMD:
 
         return selected_points
 
+    def _run_events_unsequenced(self, events):
+        """Run *events* as a single MDA with hardware sequencing disabled.
+
+        A separate ``mmc.mda.run`` per event brackets each one with
+        setup/teardown_sequence, which stop and restart ``KeepDMDAlive``; each
+        restart re-displays the all-on live pattern and resets the SLM
+        ExposureTime, so under OverlapMode a spot can end up on a short exposure
+        that blanks before the camera opens. Running every event in one MDA
+        pauses ``KeepDMDAlive`` just once.
+
+        Sequencing must be off: with it on, pymmcore-plus tries to
+        hardware-combine the consecutive SLM events into an ``slm_sequence`` and
+        fails validation (``SLMImage`` is not ``bytes``). With it off, the
+        events still run one at a time within the single MDA.
+        """
+        engine = getattr(self.mmc.mda, "engine", None)
+        prev = getattr(engine, "use_hardware_sequencing", None)
+        if engine is not None:
+            engine.use_hardware_sequencing = False
+        try:
+            self.mmc.mda.run(events)
+        finally:
+            if engine is not None and prev is not None:
+                engine.use_hardware_sequencing = prev
+
     def calibrate(
         self,
+        calibration_channel,
         verbose=False,
         n_points=9,
         radius=4,
@@ -195,6 +285,11 @@ class DMD:
         Projects 3 points in DMD space and detects them in camera space,
         then finds the affine transofmation matrix.
         Args:
+            calibration_channel (Channel/PowerChannel): light path used to
+                image the DMD spots (config/group set the channel; for a
+                PowerChannel the power is resolved via the microscope's
+                resolve_power). Pass per experiment — e.g. a UV or a cyan
+                channel — so it isn't fixed on the microscope.
             verbose (bool, optional): Whether to display additional images during calibration. Defaults to False.
             blur (int, optional): Blur size for captured images. Defaults to 10.
             circle_size (int, optional): Size of the calibration circle projected. Defaults to 10.
@@ -231,43 +326,23 @@ class DMD:
             event_p = MDAEvent(
                 slm_image=SLMImage(data=img_p, device=self.name),
                 exposure=exposure,
-                channel={
-                    "config": self.calibration_profile["channel_config"],
-                    "group": self.calibration_profile["channel_group"],
-                },
-                properties=[
-                    (
-                        self.calibration_profile["device_name"],
-                        self.calibration_profile["property_name"],
-                        self.calibration_profile["power"],
-                    )
-                ],
+                channel=self._calibration_channel_dict(calibration_channel),
+                properties=self._calibration_properties(calibration_channel),
             )
             events.append(event_p)
 
-        try:
-            self.mmc.mda.events.frameReady.disconnect()
-        except Exception:
-            pass
-
+        # Connect a calibration-only frame collector. Do NOT call the
+        # no-arg frameReady.disconnect() -- that removes EVERY listener,
+        # including napari-micromanager's preview updater and the faro
+        # controller's pipeline callback, and they never come back.
+        # Connect our own handler alongside the others and disconnect
+        # only it when the collection loop is done.
         @self.mmc.mda.events.frameReady.connect
-        def new_frame(img: np.ndarray, event: MDAEvent):
+        def _collect_calibration_frame(img: np.ndarray, event: MDAEvent):
             calibration_images.append(img)
-            if verbose:
-                plt.imshow(img, cmap="gray")
-                plt.show()
 
-        for event in events:
-            self.mmc.mda.run([event])
-            time.sleep(0.1)
-
-        # Disconnect IMMEDIATELY after snapping to prevent the closure
-        # from firing during subsequent acquisitions.
-        try:
-            self.mmc.mda.events.frameReady.disconnect()
-        except Exception:
-            pass
-
+        self._run_events_unsequenced(events)
+        self.mmc.mda.events.frameReady.disconnect(_collect_calibration_frame)
         calibration_images = np.array(calibration_images)
 
         for img in calibration_images:
@@ -275,6 +350,29 @@ class DMD:
             max_x = np.argmax(img.max(axis=0))
             max_y = np.argmax(img.max(axis=1))
             dst.append((max_x, max_y))
+
+        if verbose:
+            n = len(calibration_images)
+            cols = int(np.ceil(np.sqrt(n)))
+            rows = int(np.ceil(n / cols))
+            fig, axs = plt.subplots(
+                rows, cols, figsize=(3 * cols, 3 * rows), dpi=120, squeeze=False
+            )
+            for ax, img, (mx, my), (sx, sy) in zip(
+                axs.flat, calibration_images, dst, src
+            ):
+                ax.imshow(img, cmap="gray")
+                ax.scatter(
+                    mx, my, marker="o", s=120,
+                    facecolors="none", edgecolors="red", linewidths=1.2,
+                )
+                ax.set_title(f"DMD ({sx},{sy}) -> cam ({mx},{my})", fontsize=8)
+                ax.axis("off")
+            for ax in axs.flat[n:]:
+                ax.axis("off")
+            fig.suptitle("Calibration frames with detected spots (red x)")
+            fig.tight_layout()
+            plt.show()
 
         src = np.array(src)
         dst = np.array(dst)
@@ -287,29 +385,14 @@ class DMD:
             max_trials=5000,
         )
 
+        # ``ransac`` returns ``inliers=None`` when it cannot fit any model at
+        # all; guard before summing so that case reports a failed calibration
+        # instead of raising (inscoper).
         if inliers is None or np.sum(inliers) < 4:
-            try:
-                self.mmc.mda.events.frameReady.disconnect()
-            except Exception:
-                pass
-            self.mmc.mda.run(
-                [
-                    MDAEvent(
-                        slm_image=SLMImage(data=self.sample_mask_off, device=self.name),
-                        exposure=1,
-                        properties=[
-                            (
-                                self.calibration_profile["device_name"],
-                                self.calibration_profile["property_name"],
-                                0,
-                            )
-                        ],
-                    )
-                ]
-            )
-
+            self._set_calibration_power(calibration_channel, 0)
+            n_inliers = 0 if inliers is None else np.sum(inliers)
             print(
-                f"Not enough inliers found for calibration. Total inliers: {np.sum(inliers)}, required: 5. Try again. "
+                f"Not enough inliers found for calibration. Total inliers: {n_inliers}, required: 5. Try again. "
             )
             self.all_on()
             return
@@ -322,55 +405,41 @@ class DMD:
             test_image = []
             test_src = []
             test_dst = []
-            p0, p1, p2 = ([300, 500], [650, 200], [500, 800])
             camera_height = self.mmc.getImageHeight()
             camera_width = self.mmc.getImageWidth()
+            # Scale test points to the live camera dimensions. Hardcoded
+            # values fall outside the ROI/binning combo on most setups,
+            # which leaves img_p empty -> img_warp empty -> no spot fires.
+            p0 = [camera_height // 4, camera_width // 4]
+            p1 = [camera_height // 2, camera_width // 2]
+            p2 = [3 * camera_height // 4, 3 * camera_width // 4]
 
             for p in [p0, p1, p2]:
                 img_p = np.zeros((camera_height, camera_width)).astype(np.uint8)
-                rr, cc = skimage.draw.disk((p[0], p[1]), 20)
+                rr, cc = skimage.draw.disk((p[0], p[1]), radius)
                 test_src.append((p[1], p[0]))
                 img_p[rr, cc] = 255
                 img_warp = self.affine_transform(img_p)
 
+                # No exposure on SLMImage — match the calibration events
+                # above. Setting SLM exposure to ``exposure`` (e.g. 25 ms)
+                # blanks the DMD long before the camera opens when the
+                # scope is in OverlapMode=Off (which the focus-aid cells
+                # leave it in), so the test capture comes back blank.
                 event_p = MDAEvent(
-                    slm_image=SLMImage(
-                        data=img_warp, device=self.name, exposure=exposure
-                    ),
+                    slm_image=SLMImage(data=img_warp, device=self.name),
                     exposure=exposure,
-                    channel={
-                        "config": self.calibration_profile["channel_config"],
-                        "group": self.calibration_profile["channel_group"],
-                    },
-                    properties=[
-                        (
-                            self.calibration_profile["device_name"],
-                            self.calibration_profile["property_name"],
-                            self.calibration_profile["power"],
-                        )
-                    ],
+                    channel=self._calibration_channel_dict(calibration_channel),
+                    properties=self._calibration_properties(calibration_channel),
                 )
                 events.append(event_p)
 
-            try:
-                self.mmc.mda.events.frameReady.disconnect()
-            except Exception:
-                pass
-
             @self.mmc.mda.events.frameReady.connect
-            def new_frame(img: np.ndarray, event: MDAEvent):
+            def _collect_test_frame(img: np.ndarray, event: MDAEvent):
                 test_image.append(img)
 
-            acq_thread = self.mmc.mda.run(events)
-            if acq_thread is not None:
-                acq_thread.join(timeout=120)
-            else:
-                timeout = 30
-                poll_interval = 0.1
-                elapsed = 0.0
-                while len(test_image) < len(events) and elapsed < timeout:
-                    time.sleep(poll_interval)
-                    elapsed += poll_interval
+            self._run_events_unsequenced(events)
+            self.mmc.mda.events.frameReady.disconnect(_collect_test_frame)
             calibration_images = np.array(calibration_images)
             for img in test_image:
                 img = skimage.filters.gaussian(img, sigma=1)
@@ -386,39 +455,32 @@ class DMD:
             for i in range(3):
                 axs[i].imshow(test_image[i], cmap="gray")
                 axs[i].scatter(
-                    test_dst[i][0], test_dst[i][1], marker="x", facecolors="red"
+                    test_dst[i][0], test_dst[i][1], marker="o", s=120,
+                    facecolors="none", edgecolors="red", linewidths=1.2,
+                    label="detected" if i == 0 else None,
                 )
                 axs[i].scatter(
-                    test_src[i][0], test_src[i][1], marker="x", facecolors="green"
+                    test_src[i][0], test_src[i][1], marker="o", s=120,
+                    facecolors="none", edgecolors="lime", linewidths=1.2,
+                    label="requested" if i == 0 else None,
                 )
+                if i == 0:
+                    axs[i].legend(loc="upper right", fontsize=8)
 
             for i in range(3):
                 axs[3].scatter(
-                    test_src[i][0], test_src[i][1], marker="x", facecolor="red"
+                    test_dst[i][0], test_dst[i][1], marker="o", s=120,
+                    facecolors="none", edgecolors="red", linewidths=1.2,
                 )
                 axs[3].scatter(
-                    test_dst[i][0], test_dst[i][1], marker="x", facecolor="green"
+                    test_src[i][0], test_src[i][1], marker="o", s=120,
+                    facecolors="none", edgecolors="lime", linewidths=1.2,
                 )
             axs[3].set_xlim(0, camera_width)
             axs[3].set_ylim(camera_height, 0)
 
             plt.show()
-        try:
-            self.mmc.mda.events.frameReady.disconnect()
-        except Exception:
-            pass
-        self.mmc.mda.run(
-            [
-                MDAEvent(
-                    slm_image=SLMImage(data=self.sample_mask_off, device=self.name),
-                    exposure=1,
-                    properties=[
-                        (
-                            self.calibration_profile["device_name"],
-                            self.calibration_profile["property_name"],
-                            0,
-                        )
-                    ],
-                )
-            ]
-        )
+        # Switch the calibration line off, then restore the live-view pattern
+        # (all-on) so the DMD doesn't sit blank after a successful calibration.
+        self._set_calibration_power(calibration_channel, 0)
+        self.all_on()

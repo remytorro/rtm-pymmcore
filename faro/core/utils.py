@@ -4,13 +4,22 @@ import numpy as np
 import os
 from collections import namedtuple, defaultdict
 from skimage.util import map_array
-from rtm_pymmcore.core.data_structures import Channel, PowerChannel, FovState, RTMEvent, RTMSequence
+from faro.core.data_structures import (
+    Channel,
+    PowerChannel,
+    FovState,
+    RTMEvent,
+    RTMSequence,
+    WaitEvent,
+)
 import math
 import random
 import pandas as pd
 import dataclasses
 import re
 from pathlib import Path
+
+_TRACK_COLS_FOR_PARTICLES = frozenset({"fname", "label", "particle"})
 
 FovPosition = namedtuple("FovPosition", ["x", "y", "z", "name"])
 
@@ -79,7 +88,11 @@ def validate_hardware(events, mmc, *, power_properties=None) -> bool:
             hi = mmc.getPropertyUpperLimit(camera, "Exposure")
             checked_exposures: set[tuple[str, int]] = set()
             for event in events:
-                for ch in (*getattr(event, "channels", ()), *getattr(event, "stim_channels", ()), *getattr(event, "ref_channels", ())):
+                for ch in (
+                    *getattr(event, "channels", ()),
+                    *getattr(event, "stim_channels", ()),
+                    *getattr(event, "ref_channels", ()),
+                ):
                     if ch.exposure is None:
                         continue
                     key = (ch.config, ch.exposure)
@@ -105,12 +118,27 @@ def validate_hardware(events, mmc, *, power_properties=None) -> bool:
     _pprops = power_properties or {}
     checked_props: set[tuple] = set()
     for event in events:
-        for ch in (*getattr(event, "channels", ()), *getattr(event, "stim_channels", ()), *getattr(event, "ref_channels", ())):
+        for ch in (
+            *getattr(event, "channels", ()),
+            *getattr(event, "stim_channels", ()),
+            *getattr(event, "ref_channels", ()),
+        ):
             power = getattr(ch, "power", None)
             if power is None:
                 continue
             mapping = _pprops.get(ch.config)
             if mapping is None:
+                # A channel asks for a specific power but nothing maps its
+                # config to a device/property -> the power is silently dropped
+                # and the light source stays at its current value. Flag it so
+                # this surfaces before the run instead of as a flat exposure.
+                problems.append(
+                    f"Channel '{ch.config}' sets power={power} but has no "
+                    f"power-property mapping (not auto-detected, not in "
+                    f"POWER_PROPERTIES). The power will NOT be applied. Add it "
+                    f"to the microscope's POWER_PROPERTIES, e.g. "
+                    f"{{'{ch.config}': ('<device>', '<Color>_Level')}}."
+                )
                 continue
             device_name, property_name = mapping
             key = (device_name, property_name, power)
@@ -141,65 +169,6 @@ def validate_hardware(events, mmc, *, power_properties=None) -> bool:
     return len(problems) == 0
 
 
-def detect_power_properties(mmc, group=None) -> dict[str, tuple[str, str]]:
-    """Auto-detect per-channel power properties from the loaded Micro-Manager config.
-
-    Scans for devices with ``*_Level`` properties (e.g. Spectra, LedDMD) and
-    matches channel config presets to their corresponding power level property
-    by matching the LED color activated in each preset.
-
-    For example, with this config::
-
-        ConfigGroup,TTL_ERK,CyanStim,...,DA TTL LED,Label,Cyan
-        Property,Spectra,Cyan_Level,99
-
-    the function returns ``{"CyanStim": ("Spectra", "Cyan_Level")}``.
-
-    Parameters
-    ----------
-    mmc : CMMCorePlus
-        Initialized core instance with a config loaded.
-    group : str, optional
-        Channel group to inspect. If *None*, all config groups are scanned.
-
-    Returns
-    -------
-    dict[str, tuple[str, str]]
-        Mapping of config name to ``(device_name, property_name)``.
-    """
-    # 1. Find devices with *_Level properties (light sources like Spectra, LedDMD)
-    level_lookup: dict[str, tuple[str, str]] = {}  # color_lower → (device, prop)
-    for dev in mmc.getLoadedDevices():
-        for prop in mmc.getDevicePropertyNames(dev):
-            if prop.endswith("_Level"):
-                color = prop[:-6].lower()  # "Cyan_Level" → "cyan"
-                level_lookup[color] = (str(dev), prop)
-
-    if not level_lookup:
-        return {}
-
-    # 2. Determine which config groups to scan
-    groups = [group] if group else list(mmc.getAvailableConfigGroups())
-
-    # 3. For each channel config, check if any setting value matches a known LED color
-    result: dict[str, tuple[str, str]] = {}
-    for g in groups:
-        for config_name in mmc.getAvailableConfigs(g):
-            if config_name in result:
-                continue
-            config_data = mmc.getConfigData(g, config_name)
-            for i in range(config_data.size()):
-                value = config_data.getSetting(i).getPropertyValue().lower()
-                for color, dev_prop in level_lookup.items():
-                    if value == color or (len(color) >= 3 and value.startswith(color)):
-                        result[config_name] = dev_prop
-                        break
-                if config_name in result:
-                    break
-
-    return result
-
-
 def create_folders(path, folders):
     """Create all folders if they don't already exist.
 
@@ -219,9 +188,9 @@ def create_folders(path, folders):
 
 def labels_to_particles(labels, tracks, metadata=None):
     """Takes in a segmentation mask with labels and replaces them with track IDs that are consistent over time."""
-    # For every frame
-    # labels_stack = np.array(labels_stack)
     particles = np.zeros_like(labels)
+    if tracks.empty or not _TRACK_COLS_FOR_PARTICLES.issubset(tracks.columns):
+        return particles
     if metadata is None:
         tracks_f = tracks[(tracks["timestep"] == tracks.timestep.max())]
     else:
@@ -387,58 +356,290 @@ def _get_mda_from_file(filename):
 
 
 def _get_mda_from_viewer(viewer):
-    data_mda_fovs = viewer.window._dock_widgets["MDA"].widget().value().stage_positions
-    data_mda_fovs_dict = []
-    for data_mda in data_mda_fovs:
-        data_mda_fovs_dict.append(data_mda.model_dump())
-    data_mda_fovs = data_mda_fovs_dict
-    return data_mda_fovs
+    try:
+        mda_widget = viewer.window.dock_widgets["MDA"]
+    except KeyError as e:
+        raise KeyError(
+            "MDA dock widget not registered. Click the 'MDA' button in the "
+            "napari-micromanager toolbar (or call "
+            "`main_window._show_dock_widget('MDA')` programmatically) "
+            "before reading FOVs from the viewer."
+        ) from e
+    data_mda_fovs = mda_widget.value().stage_positions
+    return [pos.model_dump() for pos in data_mda_fovs]
+
 
 def generate_fov_positions_from_list(mic, data_mda_fovs):
     """Create FovPosition namedtuples from a list of position dicts."""
     fovs = []
     for i, fov in enumerate(data_mda_fovs):
-        z = None if getattr(mic, "ONLY_USE_PFS", False) else fov.get("z")
+        z = None if getattr(mic, "USE_ONLY_PFS", False) else fov.get("z")
         name = str(i) if fov.get("name") is None else fov["name"]
         fovs.append(FovPosition(x=fov.get("x"), y=fov.get("y"), z=z, name=name))
     return fovs
 
+
 # Backwards-compat alias
 generate_fov_objects_from_list = generate_fov_positions_from_list
 
-def generate_fov_positions(mic, viewer=None, filename=None):
+
+def generate_fov_positions(mic, viewer=None, filename=None, fake_fovs=None):
     """Create FovPosition namedtuples from viewer or file."""
-    if filename is not None:
+    if fake_fovs is not None:
+        return [FovPosition(x=0, y=0, z=None, name=str(i)) for i in range(fake_fovs)]
+    elif filename is not None:
         data_mda_fovs = _get_mda_from_file(filename)
     elif viewer is not None:
         data_mda_fovs = _get_mda_from_viewer(viewer)
         if data_mda_fovs is None:
             assert False, "No fovs selected. Please select fovs in the MDA widget"
     else:
-        assert False, "Either viewer must be provided or from_file must be True"
+        assert False, "Either viewer, filename, or fake_fovs must be provided"
 
     return generate_fov_positions_from_list(mic, data_mda_fovs)
+
 
 # Backwards-compat alias
 generate_fov_objects = generate_fov_positions
 
 
-def generate_df_acquire_simple(fovs, n_frames, time_between_timesteps, channels, start_time=0):
+def _set_mda_in_viewer(viewer, stage_positions) -> None:
+    """Write *stage_positions* (useq.Position list) into the napari-mm MDA widget.
+
+    Only the positions are replaced; the widget's other settings (time plan,
+    channels, etc.) are preserved.
+    """
+    try:
+        mda_widget = viewer.window.dock_widgets["MDA"]
+    except KeyError as e:
+        raise KeyError(
+            "MDA dock widget not registered. Click the 'MDA' button in the "
+            "napari-micromanager toolbar (or call "
+            "`main_window._show_dock_widget('MDA')` programmatically) "
+            "before writing FOVs to the viewer."
+        ) from e
+    current = mda_widget.value()
+    mda_widget.setValue(current.replace(stage_positions=tuple(stage_positions)))
+
+
+def set_fov_positions(fov_positions, viewer):
+    """Populate the napari-micromanager MDA widget with a list of FOVs.
+
+    Inverse of ``generate_fov_positions(mic, viewer=viewer)``: instead of
+    reading the FOVs the user picked in the MDA widget, push a Python list of
+    FOVs into the widget's position table — e.g. a curated/filtered list (see
+    :func:`filter_close_fovs`) or one loaded from a ``fovs.json`` file.
+
+    Args:
+        fov_positions: list of FOV positions. Each item may be a
+            ``FovPosition`` (or any object with ``.x`` / ``.y`` / ``.z`` /
+            ``.name``) or a dict with ``"x"`` / ``"y"`` / ``"z"`` / ``"name"``
+            keys (e.g. ``fovs.json`` entries).
+        viewer: napari viewer hosting the napari-micromanager MDA dock widget.
+
+    Returns:
+        The list of ``useq.Position`` written to the widget.
+
+    The MDA widget's other settings (time plan, channels, …) are preserved;
+    only the stage positions are replaced.
+    """
+    import useq
+
+    positions = []
+    for i, f in enumerate(fov_positions):
+        if isinstance(f, dict):
+            x, y, z, name = f.get("x"), f.get("y"), f.get("z"), f.get("name")
+        else:
+            x, y = f.x, f.y
+            z, name = getattr(f, "z", None), getattr(f, "name", None)
+        positions.append(
+            useq.Position(x=x, y=y, z=z, name=str(i) if name is None else name)
+        )
+    _set_mda_in_viewer(viewer, positions)
+    return positions
+
+
+# Components larger than this are solved with the greedy fallback instead of
+# the exact maximum-independent-set search, to bound worst-case runtime.
+_MIS_EXACT_LIMIT = 24
+
+
+def _mis_exact(nodes: tuple, adj: dict, memo: dict) -> set:
+    """Maximum independent set of the induced subgraph on ``nodes``.
+
+    Exhaustive include/exclude branch on the first node, memoized by node set.
+    Ties prefer *including* the lowest-index node, so lower-indexed FOVs are
+    kept preferentially.
+    """
+    if not nodes:
+        return set()
+    if nodes in memo:
+        return memo[nodes]
+    v, rest = nodes[0], nodes[1:]
+    excl = _mis_exact(rest, adj, memo)
+    rest_incl = tuple(u for u in rest if u not in adj[v])
+    incl = {v} | _mis_exact(rest_incl, adj, memo)
+    best = incl if len(incl) >= len(excl) else excl
+    memo[nodes] = best
+    return best
+
+
+def _mis_greedy(nodes: set, adj: dict) -> set:
+    """Greedy fallback: drop the highest-degree node until no edge remains.
+
+    Ties drop the higher-index node (keeps lower indices). Not optimal.
+    """
+    kept = set(nodes)
+    while True:
+        deg = {u: len(adj[u] & kept) for u in kept}
+        worst = max(kept, key=lambda u: (deg[u], u))
+        if deg[worst] == 0:
+            break
+        kept.discard(worst)
+    return kept
+
+
+def _independent_keep(n: int, adj: dict) -> set:
+    """Indices in ``range(n)`` to KEEP so no edge in ``adj`` remains, keeping
+    as many as possible (maximum independent set). Solved exactly per connected
+    component, with a greedy fallback for components above ``_MIS_EXACT_LIMIT``.
+    """
+    keep: set = set()
+    seen: set = set()
+    for start in range(n):
+        if start in seen:
+            continue
+        # BFS the connected component containing `start`
+        comp = []
+        stack = [start]
+        seen.add(start)
+        while stack:
+            u = stack.pop()
+            comp.append(u)
+            for w in adj.get(u, ()):
+                if w not in seen:
+                    seen.add(w)
+                    stack.append(w)
+        if len(comp) == 1:  # no conflicts -> always kept
+            keep.add(comp[0])
+        elif len(comp) <= _MIS_EXACT_LIMIT:
+            keep |= _mis_exact(tuple(sorted(comp)), adj, {})
+        else:
+            keep |= _mis_greedy(set(comp), adj)
+    return keep
+
+
+def filter_close_fovs(fovs, min_distance, drop=False):
+    """Report (and optionally drop) FOVs whose stage positions are too close.
+
+    Args:
+        fovs: list of FOV positions. Each item may be a ``FovPosition`` (or any
+            object with ``.x`` / ``.y`` attributes) or a dict with ``"x"`` /
+            ``"y"`` keys (e.g. entries loaded from a ``fovs.json`` file).
+        min_distance: minimum allowed centre-to-centre distance, in the same
+            units as the positions (stage micrometres on Micro-Manager).
+        drop: if True, return a new list with the too-close FOVs removed; if
+            False (default), the input list is returned unchanged (report only).
+
+    Returns:
+        The FOV list -- pruned when ``drop=True``, otherwise the original list.
+
+    Always prints the FOV count. If any pair is closer than ``min_distance`` it
+    emits a UserWarning naming every offending pair and the exact set of FOVs
+    that would be dropped -- reported in both modes, so with ``drop=False`` you
+    can see which FOVs *would* go without changing anything.
+
+    Optimal de-duplication: keeps the MAXIMUM number of FOVs such that no two
+    remaining are closer than ``min_distance`` -- a maximum independent set of
+    the "too-close" graph (FOVs = nodes, edges = pairs below the threshold) --
+    so it removes the fewest FOVs possible. Solved exactly per connected
+    component; ties keep lower-indexed FOVs. Components larger than
+    ``_MIS_EXACT_LIMIT`` nodes use a greedy high-degree-removal fallback to
+    bound runtime (rare for real layouts).
+    """
+    import warnings
+
+    def _xy(f):
+        if hasattr(f, "x"):
+            return float(f.x), float(f.y)
+        return float(f["x"]), float(f["y"])
+
+    def _label(i, f):
+        name = getattr(f, "name", None)
+        if name is None and isinstance(f, dict):
+            name = f.get("name")
+        return f"FOV {i}" + (f" ({name})" if name not in (None, str(i)) else "")
+
+    def _close_pairs(items):
+        pairs = []
+        for a in range(len(items)):
+            xa, ya = _xy(items[a])
+            for b in range(a + 1, len(items)):
+                xb, yb = _xy(items[b])
+                dist = math.hypot(xa - xb, ya - yb)
+                if dist < min_distance:
+                    pairs.append((a, b, dist))
+        return pairs
+
+    fovs = list(fovs)
+    print(f"{len(fovs)} FOVs")
+
+    pairs = _close_pairs(fovs)
+    if not pairs:
+        print(f"All FOVs are >= {min_distance} apart.")
+        return fovs
+
+    # Optimal selection: keep a maximum independent set; drop the rest.
+    adj: dict = defaultdict(set)
+    for a, b, _ in pairs:
+        adj[a].add(b)
+        adj[b].add(a)
+    keep = _independent_keep(len(fovs), adj)
+    dropped = [i for i in range(len(fovs)) if i not in keep]
+
+    warnings.warn(
+        f"{len(pairs)} FOV pair(s) closer than {min_distance}:\n"
+        + "\n".join(
+            f"  {_label(a, fovs[a])} <-> {_label(b, fovs[b])}: {d:.1f}"
+            for a, b, d in pairs
+        )
+        + f"\nWould drop {len(dropped)} FOV(s) (optimal): "
+        + (", ".join(_label(i, fovs[i]) for i in dropped) or "none"),
+        UserWarning,
+        stacklevel=2,
+    )
+
+    if not drop:
+        return fovs
+
+    dropped_set = set(dropped)
+    kept = [f for i, f in enumerate(fovs) if i not in dropped_set]
+    print(f"Dropped {len(dropped)} too-close FOV(s); {len(kept)} remain.")
+    return kept
+
+
+def generate_df_acquire_simple(
+    fovs, n_frames, time_between_timesteps, channels, start_time=0
+):
     dfs = []
     for fov_index, fov in enumerate(fovs):
         for timestep in range(n_frames):
-            dfs.append({
-                "fov": fov_index,
-                "fov_x": fov.x,
-                "fov_y": fov.y,
-                "fov_z": fov.z,
-                "fov_name": fov.name,
-                "timestep": timestep,
-                "time": start_time + timestep * time_between_timesteps,
-                "channels": tuple(dataclasses.asdict(ch) for ch in channels),
-                "fname": f"{str(fov_index).zfill(3)}_{str(timestep).zfill(5)}",
-            })
-    df_acquire = pd.DataFrame(dfs).sort_values(by=["time", "fov"]).reset_index(drop=True)
+            dfs.append(
+                {
+                    "fov": fov_index,
+                    "fov_x": fov.x,
+                    "fov_y": fov.y,
+                    "fov_z": fov.z,
+                    "fov_name": fov.name,
+                    "timestep": timestep,
+                    "time": start_time + timestep * time_between_timesteps,
+                    "channels": tuple(dataclasses.asdict(ch) for ch in channels),
+                    "fname": f"{str(fov_index).zfill(3)}_{str(timestep).zfill(5)}",
+                }
+            )
+    df_acquire = (
+        pd.DataFrame(dfs).sort_values(by=["time", "fov"]).reset_index(drop=True)
+    )
     print(f"Total Experiment Time: {df_acquire['time'].max() / 3600}h")
     return df_acquire
 
@@ -462,8 +663,10 @@ def generate_df_acquire(
     )
     timesteps = range(n_frames)
     dfs = []
-    for fov_index, fov in enumerate(fovs):
-        fov_group = fov_index // n_fovs_simultaneously
+    first_fov_index = fovs[0].index
+    for _, fov in enumerate(fovs):
+        fov_index = fov.index
+        fov_group = (fov_index - first_fov_index) // n_fovs_simultaneously
         start_time_fov = start_time + fov_group * time_between_timesteps * len(
             timesteps
         )
@@ -523,6 +726,7 @@ def apply_stim_treatments_to_df_acquire(
     n_fovs_per_well=None,
     add_stim_exposure_group=False,
     regular_spacing_between_stimulations=False,
+    randomize=False,
 ):
     """Apply stim treatments to the df_acquire dataframe."""
 
@@ -533,11 +737,13 @@ def apply_stim_treatments_to_df_acquire(
             n_fovs // n_stim_treatments // len(np.unique(condition))
         )
         stim_treatment_tot = []
-        random.shuffle(stim_treatments)
+        if randomize:
+            random.shuffle(stim_treatments)
         if n_fovs_per_well is None:
             for fov_index in range(0, n_fovs_per_stim_condition + 1):
                 stim_treatment_tot.extend(stim_treatments)
-            random.shuffle(stim_treatment_tot)
+            if randomize:
+                random.shuffle(stim_treatment_tot)
             if n_fovs % n_stim_treatments != 0:
                 print(
                     f"Warning: Not equal number of fovs per stim condition. {n_fovs % n_stim_treatments} fovs will have repeated treatment"
@@ -694,6 +900,7 @@ def generate_exp_data_from_tracks(path):
 # RTMEvent-based helpers
 # ---------------------------------------------------------------------------
 
+
 def events_to_dataframe(events: list) -> pd.DataFrame:
     """Convert RTMEvent (or MDAEvent) list to summary DataFrame.
 
@@ -702,6 +909,8 @@ def events_to_dataframe(events: list) -> pd.DataFrame:
     """
     rows = []
     for e in events:
+        if isinstance(e, WaitEvent):
+            continue  # timed gap, not an acquired frame
         channels = getattr(e, "channels", ())
         stim_channels = getattr(e, "stim_channels", ())
         ref_channels = getattr(e, "ref_channels", ())
@@ -728,8 +937,7 @@ def events_to_dataframe(events: list) -> pd.DataFrame:
             row["stim_power"] = getattr(stim_channels[0], "power", None)
             row["stim_exposure"] = stim_channels[0].exposure
         rows.append(row)
-    return pd.DataFrame(rows)
-
+    return pd.DataFrame(rows).sort_values(by=["timestep", "fov"]).reset_index(drop=True)
 
 
 def merge_rtm_sequences(
@@ -768,10 +976,12 @@ def merge_rtm_sequences(
         local_fovs = sorted({e.index.get("p", 0) for e in events})
         for lp in local_fovs:
             fov_evs = [e for e in events if e.index.get("p", 0) == lp]
-            fov_event_lists.append([
-                ev.model_copy(update={"index": {**dict(ev.index), "p": global_p}})
-                for ev in fov_evs
-            ])
+            fov_event_lists.append(
+                [
+                    ev.model_copy(update={"index": {**dict(ev.index), "p": global_p}})
+                    for ev in fov_evs
+                ]
+            )
             global_p += 1
 
     total_fovs = len(fov_event_lists)
@@ -784,33 +994,33 @@ def merge_rtm_sequences(
             interval = unique_times[1] - unique_times[0]
         else:
             interval = 0
-        n_parallel = max(1, int(interval // time_per_fov)) if interval > 0 else total_fovs
+        n_parallel = (
+            max(1, int(interval // time_per_fov)) if interval > 0 else total_fovs
+        )
     else:
         n_parallel = total_fovs
 
-    # 3. Group FOVs into parallel batches
+    # 3. Group FOVs into parallel batches.
+    # Wall-clock (min_start_time) is offset per batch so events stay in
+    # chronological order; the ``t`` index is *not* offset, so every FOV
+    # writes to its own per-FOV-relative t in the zarr store and overflow
+    # batches stack along p instead of along t.
     result: list[RTMEvent] = []
-    t_offset = 0
     time_offset = 0.0
 
     for batch_start in range(0, total_fovs, n_parallel):
-        batch = fov_event_lists[batch_start:batch_start + n_parallel]
+        batch = fov_event_lists[batch_start : batch_start + n_parallel]
 
         for fov_evs in batch:
             for ev in fov_evs:
-                new_t = ev.index.get("t", 0) + t_offset
                 new_time = (ev.min_start_time or 0) + time_offset
-                result.append(ev.model_copy(update={
-                    "index": {**dict(ev.index), "t": new_t},
-                    "min_start_time": new_time,
-                }))
+                result.append(ev.model_copy(update={"min_start_time": new_time}))
 
         # Offset for next batch: last timepoint start + time to image batch FOVs
         batch_max_time = max(e.min_start_time or 0 for fov in batch for e in fov)
-        batch_max_t = max(e.index.get("t", 0) for fov in batch for e in fov)
         time_offset += batch_max_time + len(batch) * time_per_fov
-        t_offset += batch_max_t + 1
 
+    result.sort(key=lambda e: (e.min_start_time or 0, e.index.get("p", 0)))
     return result
 
 
@@ -828,7 +1038,9 @@ def _infer_interval(events: list[RTMEvent]) -> float:
 
 
 def _resolve_n_parallel(
-    events: list[RTMEvent], time_per_fov: float, n_parallel: int | None,
+    events: list[RTMEvent],
+    time_per_fov: float,
+    n_parallel: int | None,
 ) -> int:
     """Return *n_parallel*, computing it from the interval if not given."""
     if n_parallel is not None:
@@ -840,7 +1052,9 @@ def _resolve_n_parallel(
 
 
 def check_fov_batching(
-    events: list[RTMEvent], time_per_fov: float, n_parallel: int | None = None,
+    events: list[RTMEvent],
+    time_per_fov: float,
+    n_parallel: int | None = None,
 ) -> bool:
     """Check whether FOVs in an event list can be imaged in parallel.
 
@@ -871,6 +1085,7 @@ def apply_fov_batching(
     events: list[RTMEvent],
     time_per_fov: float,
     n_parallel: int | None = None,
+    offset_min_start_time: bool = True,
 ) -> list[RTMEvent]:
     """Adjust timing so that overflow FOVs run in subsequent batches.
 
@@ -884,6 +1099,15 @@ def apply_fov_batching(
         time_per_fov: Time (in seconds) to image one FOV.
         n_parallel: Max FOVs per batch.  If *None*, computed from
             ``time_per_fov`` and the inferred timepoint interval.
+        offset_min_start_time: When True (default), stagger each FOV's
+            ``min_start_time`` by its position within its batch times
+            ``time_per_fov``. FOVs in a batch are imaged sequentially,
+            not simultaneously, so the k-th FOV of a batch only starts
+            ~``k * time_per_fov`` after the first. Encoding that in
+            ``min_start_time`` keeps the scheduled per-FOV frame interval
+            consistent and makes lag measurement meaningful. The first
+            FOV of every batch gets 0 offset (its batch wall-clock
+            offset still applies for batches > 0).
 
     Returns:
         New list of RTMEvent with adjusted ``min_start_time`` and ``t``
@@ -893,33 +1117,41 @@ def apply_fov_batching(
     fov_ids = sorted({e.index.get("p", 0) for e in events})
     n_fovs = len(fov_ids)
 
-    if n_fovs <= n_parallel:
+    # A single batch with no per-FOV stagger requested is a no-op.
+    if n_fovs <= n_parallel and not offset_min_start_time:
         return list(events)
 
-    # Map each FOV to its batch index
-    fov_to_batch = {fov: i // n_parallel for i, fov in enumerate(fov_ids)}
+    # Sorted position of each FOV: batch = pos // n_parallel,
+    # within-batch slot = pos % n_parallel.
+    fov_pos = {fov: i for i, fov in enumerate(fov_ids)}
 
-    # Compute per-batch offsets
-    # Batch 0 events determine the experiment duration
-    batch0_events = [e for e in events if fov_to_batch[e.index.get("p", 0)] == 0]
-    max_t_batch0 = max(e.index.get("t", 0) for e in batch0_events)
-    max_time_batch0 = max(e.min_start_time or 0 for e in batch0_events)
+    # Per-batch wall-clock offset — the ``t`` index stays per-FOV
+    # relative (every FOV uses 0..N-1) so the writer's time axis is
+    # aligned across batches instead of concatenated. Without this each
+    # batch was mapped to a disjoint slab of t and the zarr store had
+    # n_batches * N empty rows per FOV.
+    batch0_events = [
+        e for e in events if fov_pos[e.index.get("p", 0)] // n_parallel == 0
+    ]
+    max_time_batch0 = max((e.min_start_time or 0 for e in batch0_events), default=0)
     batch_duration = max_time_batch0 + n_parallel * time_per_fov
 
     result: list[RTMEvent] = []
     for ev in events:
         fov = ev.index.get("p", 0)
-        batch = fov_to_batch[fov]
-        if batch == 0:
+        pos = fov_pos[fov]
+        batch = pos // n_parallel
+        slot = pos % n_parallel
+
+        offset = batch * batch_duration
+        if offset_min_start_time:
+            offset += slot * time_per_fov
+
+        if offset == 0:
             result.append(ev)
         else:
-            t_offset = batch * (max_t_batch0 + 1)
-            time_offset = batch * batch_duration
-            new_t = ev.index.get("t", 0) + t_offset
-            new_time = (ev.min_start_time or 0) + time_offset
-            result.append(ev.model_copy(update={
-                "index": {**dict(ev.index), "t": new_t},
-                "min_start_time": new_time,
-            }))
+            new_time = (ev.min_start_time or 0) + offset
+            result.append(ev.model_copy(update={"min_start_time": new_time}))
 
+    result.sort(key=lambda e: (e.min_start_time or 0, e.index.get("p", 0)))
     return result

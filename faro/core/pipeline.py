@@ -9,19 +9,29 @@ import pandas as pd
 import tifffile
 from useq import MDAEvent
 
-import rtm_pymmcore.segmentation.base as base_segmentation
-import rtm_pymmcore.stimulation.base as base_stimulation
-from rtm_pymmcore.stimulation.base import StimWithImage, StimWithPipeline
-import rtm_pymmcore.tracking.base as abstract_tracker
-import rtm_pymmcore.feature_extraction.base as abstract_fe
-from rtm_pymmcore.core.data_structures import FovState, ImgType, SegmentationMethod
-from rtm_pymmcore.core.utils import labels_to_particles, create_folders
+import faro.segmentation.base as base_segmentation
+import faro.stimulation.base as base_stimulation
+from faro.stimulation.base import StimWithImage, StimWithPipeline
+import faro.tracking.base as abstract_tracker
+import faro.feature_extraction.base as abstract_fe
+from faro.core.data_structures import FovState, ImgType, SegmentationMethod, WaitEvent
+from faro.core.utils import labels_to_particles, create_folders
 from datetime import datetime
 import queue
 
 
-def store_img(img: np.array, metadata, path: str, folder: str):
-    """Take the image and store it accordingly. Check the metadata for FOV index and timestamp."""
+def store_img(img: np.array, metadata, path: str, folder: str, *, writer=None):
+    """Take the image and store it accordingly. Check the metadata for FOV index and timestamp.
+
+    If *writer* is provided, delegates to the writer backend.
+    Otherwise falls back to direct TIFF write (legacy path).
+    """
+    if isinstance(img, (bool, np.bool_)):
+        h, w = metadata["img_shape"]
+        img = np.full((h, w), int(img), dtype=np.uint8)
+    if writer is not None:
+        writer.write(img, metadata, folder)
+        return
     fname = metadata["fname"]
     tifffile.imwrite(
         os.path.join(path, folder, fname + ".tiff"),
@@ -55,32 +65,43 @@ def run_tracking(tracker, df_old, df_new, fov_obj):
     return pd.concat([df_old, df_new], ignore_index=True)
 
 
-def extract_and_merge_features(feature_extractor, segmentation_results, img, df_tracked, metadata):
+def extract_and_merge_features(
+    feature_extractor, segmentation_results, img, df_tracked, metadata
+):
     """Run feature extraction and merge features into current-frame rows of df_tracked."""
-    if feature_extractor is not None:
-        features_df, masks_for_fe = feature_extractor.extract_features(
-            segmentation_results, img, df_tracked, metadata
+    if (
+        feature_extractor is None
+        or df_tracked.empty
+        or "fname" not in df_tracked.columns
+    ):
+        return None
+    features_df, masks_for_fe = feature_extractor.extract_features(
+        segmentation_results, img, df_tracked, metadata
+    )
+    feature_map = features_df.set_index("label")
+    current_mask = df_tracked["fname"] == metadata["fname"]
+    for col in feature_map.columns:
+        df_tracked.loc[current_mask, col] = df_tracked.loc[current_mask, "label"].map(
+            feature_map[col]
         )
-        feature_map = features_df.set_index("label")
-        current_mask = df_tracked["fname"] == metadata["fname"]
-        for col in feature_map.columns:
-            df_tracked.loc[current_mask, col] = (
-                df_tracked.loc[current_mask, "label"].map(feature_map[col])
-            )
-        return masks_for_fe
-    return None
+    return masks_for_fe
 
 
-def dispatch_stim_mask(stimulator, segmentation_results, metadata, *, img=None, tracks=None):
+def dispatch_stim_mask(
+    stimulator, segmentation_results, metadata, *, img=None, tracks=None
+):
     """Dispatch get_stim_mask() based on stimulator type hierarchy."""
     if isinstance(stimulator, StimWithPipeline):
         stim_mask, _ = stimulator.get_stim_mask(
-            label_images=segmentation_results, metadata=metadata,
-            img=img, tracks=tracks,
+            label_images=segmentation_results,
+            metadata=metadata,
+            img=img,
+            tracks=tracks,
         )
     elif isinstance(stimulator, StimWithImage):
         stim_mask, _ = stimulator.get_stim_mask(
-            metadata=metadata, img=img,
+            metadata=metadata,
+            img=img,
         )
     else:
         stim_mask, _ = stimulator.get_stim_mask(
@@ -104,9 +125,7 @@ def convert_track_dtypes(df):
     }
 
     existing_columns = {
-        col: dtype
-        for col, dtype in df_datatypes.items()
-        if col in df.columns
+        col: dtype for col, dtype in df_datatypes.items() if col in df.columns
     }
 
     try:
@@ -118,23 +137,35 @@ def convert_track_dtypes(df):
     return df
 
 
-def save_segmentation_results(segmentation_results, segmentators, tracker, df, metadata, storage_path, *, save_labels=True):
+def save_segmentation_results(
+    segmentation_results,
+    segmentators,
+    tracker,
+    df,
+    metadata,
+    storage_path,
+    *,
+    save_labels=True,
+    writer=None,
+):
     """Save segmentation masks and optionally tracked-label images."""
     if tracker is None:
         for key, value in segmentation_results.items():
-            store_img(value, metadata, storage_path, key)
+            store_img(value, metadata, storage_path, key, writer=writer)
     else:
         for (key, value), segmentator in zip(
             segmentation_results.items(), segmentators
         ):
             if segmentator.save_tracked:
                 tracked_label = labels_to_particles(value, df, metadata=metadata)
-                store_img(tracked_label, metadata, storage_path, "particles")
+                store_img(
+                    tracked_label, metadata, storage_path, "particles", writer=writer
+                )
                 if save_labels:
-                    store_img(value, metadata, storage_path, key)
+                    store_img(value, metadata, storage_path, key, writer=writer)
             else:
                 if save_labels:
-                    store_img(value, metadata, storage_path, key)
+                    store_img(value, metadata, storage_path, key, writer=writer)
 
 
 # Create a new pipeline class that contains a segmentator and a stimulator
@@ -155,24 +186,12 @@ class ImageProcessingPipeline:
         self.tracker = tracker
         self.feature_extractor_ref = feature_extractor_ref
         self.storage_path = storage_path
-        folders = ["raw", "tracks"]
         self.only_save_every_n_frames = only_save_every_n_frames
-        if self.stimulator is not None:
-            folders.extend(["stim_mask", "stim"])
-        if self.tracker is not None:
-            folders.append("particles")
-        if self.feature_extractor is not None:
-            if hasattr(self.feature_extractor, "extra_folders"):
-                folders.extend(self.feature_extractor.extra_folders)
-        if self.segmentators is not None:
-            for seg in self.segmentators:
-                folders.append(seg.name)
-        if feature_extractor_ref is not None:
-            folders.append("ref")
-            if hasattr(feature_extractor_ref, "extra_folders"):
-                folders.extend(feature_extractor_ref.extra_folders)
-        create_folders(self.storage_path, folders)
+        # Only create tracks/ here — image folders are handled by the writer.
+        # TiffWriter creates them on demand; OmeZarrWriter uses the zarr store.
+        create_folders(self.storage_path, ["tracks"])
         self._analyzer = None  # set by Analyzer.__init__
+        self._writer = None  # set by Analyzer or Controller
         self._queue_timeout: float = 20  # seconds; override in tests
 
     @staticmethod
@@ -197,18 +216,15 @@ class ImageProcessingPipeline:
             return []
 
         # If the subclass accepts **kwargs it can handle anything
-        if any(p.kind == inspect.Parameter.VAR_KEYWORD
-               for p in sub_sig.parameters.values()):
+        if any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sub_sig.parameters.values()
+        ):
             return []
 
         base_params = {
-            name for name, p in base_sig.parameters.items()
-            if name != "self"
+            name for name, p in base_sig.parameters.items() if name != "self"
         }
-        sub_params = {
-            name for name, p in sub_sig.parameters.items()
-            if name != "self"
-        }
+        sub_params = {name for name, p in sub_sig.parameters.items() if name != "self"}
 
         missing = base_params - sub_params
         if missing:
@@ -238,20 +254,29 @@ class ImageProcessingPipeline:
         # --- Signature checks: subclass must accept base class params ---
         if self.segmentators:
             for seg in self.segmentators:
-                warnings_list.extend(self._check_method_against_base(
-                    seg.segmentation_class,
-                    base_segmentation.Segmentator, "segment",
-                ))
+                warnings_list.extend(
+                    self._check_method_against_base(
+                        seg.segmentation_class,
+                        base_segmentation.Segmentator,
+                        "segment",
+                    )
+                )
         if self.tracker:
-            warnings_list.extend(self._check_method_against_base(
-                self.tracker,
-                abstract_tracker.Tracker, "track_cells",
-            ))
+            warnings_list.extend(
+                self._check_method_against_base(
+                    self.tracker,
+                    abstract_tracker.Tracker,
+                    "track_cells",
+                )
+            )
         if self.feature_extractor:
-            warnings_list.extend(self._check_method_against_base(
-                self.feature_extractor,
-                abstract_fe.FeatureExtractor, "extract_features",
-            ))
+            warnings_list.extend(
+                self._check_method_against_base(
+                    self.feature_extractor,
+                    abstract_fe.FeatureExtractor,
+                    "extract_features",
+                )
+            )
         if self.stimulator:
             if isinstance(self.stimulator, StimWithPipeline):
                 stim_base = StimWithPipeline
@@ -259,26 +284,35 @@ class ImageProcessingPipeline:
                 stim_base = StimWithImage
             else:
                 stim_base = base_stimulation.Stim
-            warnings_list.extend(self._check_method_against_base(
-                self.stimulator,
-                stim_base, "get_stim_mask",
-            ))
+            warnings_list.extend(
+                self._check_method_against_base(
+                    self.stimulator,
+                    stim_base,
+                    "get_stim_mask",
+                )
+            )
 
         # --- Required metadata checks ---
         general_required = set()
         if self.segmentators:
             for seg in self.segmentators:
-                general_required |= getattr(seg.segmentation_class, "required_metadata", set())
+                general_required |= getattr(
+                    seg.segmentation_class, "required_metadata", set()
+                )
         if self.tracker:
             general_required |= getattr(self.tracker, "required_metadata", set())
         if self.feature_extractor:
-            general_required |= getattr(self.feature_extractor, "required_metadata", set())
+            general_required |= getattr(
+                self.feature_extractor, "required_metadata", set()
+            )
 
         stim_required = set()
         if self.stimulator:
             stim_required = getattr(self.stimulator, "required_metadata", set())
 
         for event in events:
+            if isinstance(event, WaitEvent):
+                continue  # timed gap, carries no acquisition metadata
             meta_keys = set(event.metadata.keys())
             # General requirements (all events)
             missing = general_required - meta_keys
@@ -295,9 +329,20 @@ class ImageProcessingPipeline:
                         f"Stim event t={event.index.get('t')} p={event.index.get('p')} "
                         f"missing stim metadata: {missing_stim}"
                     )
+            # Phased-storage requirement: run() names the per-phase tracks file
+            # {fov}_phase_{phase_id}_latest.parquet and reads metadata['phase_id']
+            # directly, so phase_name without phase_id would crash storage mid-run.
+            if "phase_name" in meta_keys and "phase_id" not in meta_keys:
+                warnings_list.append(
+                    f"Event t={event.index.get('t')} p={event.index.get('p')} "
+                    f"has 'phase_name' but no 'phase_id'; add phase_id to the "
+                    f"RTMSequence rtm_metadata (the pipeline needs it to name the "
+                    f"per-phase tracks file)."
+                )
 
         if warnings_list:
             import warnings as w
+
             for msg in warnings_list:
                 w.warn(msg, UserWarning)
         return len(warnings_list) == 0
@@ -343,12 +388,27 @@ class ImageProcessingPipeline:
         metadata["time_acquired"] = datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
         fov_obj: FovState = self._analyzer.get_fov_state(metadata["fov"])
 
+        frame_idx = event.index.get("t", 0)
+
         filename_for_parquet = f"{metadata['fov']}_latest.parquet"
-        if "phase_id" in metadata or "phase_name" in metadata:
-            metadata["fov_timestep"] = fov_obj.fov_timestep_counter
+        # A per-phase tracks file needs phase_id; key off it (not phase_name)
+        # so phase_name-without-phase_id can't KeyError here. validate_pipeline
+        # flags that combination up front.
+        if "phase_id" in metadata:
+            metadata["fov_timestep"] = frame_idx
             filename_for_parquet = (
                 f"{metadata['fov']}_phase_{metadata['phase_id']}_latest.parquet"
             )
+
+        # Split ref channels off the combined image so that segmentation and
+        # regular feature extraction only see imaging channels.
+        img_ref = None
+        if metadata.get("img_type") == ImgType.IMG_REF:
+            n_ref_channels = len(metadata.get("ref_channels", ()))
+            n_channels = len(metadata.get("channels", ()))
+            if n_ref_channels > 0 and img.shape[0] > n_channels:
+                img_ref = img[n_channels:]
+                img = img[:n_channels]
 
         shape_img = (img.shape[-2], img.shape[-1])
         metadata["img_shape"] = shape_img
@@ -359,104 +419,177 @@ class ImageProcessingPipeline:
         segmentation_results = {}
         if self.segmentators is not None:
             for seg in self.segmentators:
+                # use_channel is an int -> 2D (Y, X), or a list -> (C, Y, X)
+                # via numpy fancy indexing (multi-channel, CellposeV4 only).
                 segmentation_results[seg.name] = seg.segmentation_class.segment(
                     img[seg.use_channel, :, :]
                 )
 
         # 1. Extract positions (label, x, y) for tracking
         fov_obj.n_cells_latest = int(segmentation_results["labels"].max())
-        df_new = build_frame_dataframe(self.feature_extractor, segmentation_results, metadata)
+        df_new = build_frame_dataframe(
+            self.feature_extractor, segmentation_results, metadata
+        )
 
         # --- Wait for previous frame's tracked DataFrame ---
-        if self.stimulator is not None and not isinstance(self.stimulator, StimWithPipeline):
+        if self.stimulator is not None and not isinstance(
+            self.stimulator, StimWithPipeline
+        ):
             timeout_time = self._queue_timeout * 3
         else:
             timeout_time = self._queue_timeout
 
         try:
-            df_old = fov_obj.tracks_queue.get(block=True, timeout=timeout_time)
-
-        except Exception as e:
+            df_old = fov_obj.tracks_queue.get_predecessor(
+                frame_idx, timeout=timeout_time
+            )
+        except queue.Empty as e:
             print("Exception", e)
-            # If queue is empty → fallback to file-based recovery
+            # Predecessor never arrived → fallback to file-based recovery
             file_path = os.path.join(self.storage_path, "tracks", filename_for_parquet)
             try:
                 df_old = pd.read_parquet(file_path)
             except FileNotFoundError:
-                df_old = pd.DataFrame()
+                df_old = None
                 print("Attention df lost")
+        if df_old is None:
+            df_old = pd.DataFrame()
 
-        # 2. Track (needs df_old from previous frame)
-        df_tracked = run_tracking(self.tracker, df_old, df_new, fov_obj)
-
-        # 3. Feature extraction (now has access to df_tracked)
-        masks_for_fe = extract_and_merge_features(
-            self.feature_extractor, segmentation_results, img, df_tracked, metadata
+        # The dispenser guarantees only one worker is between get_predecessor
+        # and put_for_frame per FOV, so setting the legacy counter here is safe
+        # for the tracker to read. If anything below raises, the finally block
+        # skips both dispensers so downstream workers don't deadlock.
+        fov_obj.fov_timestep_counter = frame_idx
+        tracked_ok = False
+        stim_mask_put = False  # did we put a mask on the stim dispenser?
+        uses_pipeline_stim = isinstance(self.stimulator, StimWithPipeline)
+        uses_image_stim = isinstance(self.stimulator, StimWithImage)
+        analyzer_mode = self._analyzer.stim_mode if self._analyzer is not None else None
+        # Compute locally in the pipeline for:
+        #  * StimWithPipeline on stim frames (always), and on every frame in
+        #    "previous" mode so the next frame's t-1 peek finds the mask.
+        #  * Base Stim on stim frames — controller also computes synchronously
+        #    for firing, but the pipeline still needs a local copy to store.
+        # StimWithImage's mask is produced by the storage_worker; the pipeline
+        # only peeks the dispenser for the storage step.
+        pipeline_will_produce_mask = uses_pipeline_stim and (
+            metadata["stim"] or analyzer_mode == "previous"
         )
+        stim_needs_compute = pipeline_will_produce_mask or (
+            self.stimulator is not None and not uses_image_stim and metadata["stim"]
+        )
+        stim_mask = None  # local for storage
+        try:
+            df_tracked = run_tracking(self.tracker, df_old, df_new, fov_obj)
 
-        if metadata["stim"] == True:
-            stim_mask = dispatch_stim_mask(
-                self.stimulator, segmentation_results, metadata,
-                img=img, tracks=df_tracked,
-            )
-            if isinstance(self.stimulator, StimWithPipeline):
-                fov_obj.stim_mask_queue.put_nowait(stim_mask)
-
-        if metadata.get("img_type") == ImgType.IMG_REF:
-            if (
-                self.feature_extractor_ref is not None
-                and self.tracker is not None
-            ):
-                df_tracked = self.feature_extractor_ref.extract_features(
+            # Stim-mask compute happens before feature extraction so a FE
+            # crash can't hold up the controller waiting on a stim_mask
+            # that would otherwise never be put. (The finally still
+            # skip_frames on failure as a second line of defence.)
+            if stim_needs_compute:
+                stim_mask = dispatch_stim_mask(
+                    self.stimulator,
                     segmentation_results,
-                    img,
-                    df_tracked,
                     metadata,
+                    img=img,
+                    tracks=df_tracked,
                 )
+                if uses_pipeline_stim:
+                    fov_obj.stim_mask_queue.put_for_frame(frame_idx, stim_mask)
+                    stim_mask_put = True
 
-        # --- Unblock the next frame ---
-        # df_tracked is fully populated (features, stim, ref).
-        # Parquet + TIFF saves below use their own data and unique filenames,
-        # so they're safe to run concurrently with the next frame.
-        fov_obj.tracks_queue.put(df_tracked)
-        frame_counter = fov_obj.fov_timestep_counter
-        fov_obj.fov_timestep_counter += 1
+            masks_for_fe = extract_and_merge_features(
+                self.feature_extractor, segmentation_results, img, df_tracked, metadata
+            )
+
+            if metadata.get("img_type") == ImgType.IMG_REF:
+                if (
+                    self.feature_extractor_ref is not None
+                    and self.tracker is not None
+                    and not df_tracked.empty
+                    and "particle" in df_tracked.columns
+                ):
+                    df_tracked = self.feature_extractor_ref.extract_features(
+                        segmentation_results,
+                        img_ref if img_ref is not None else img,
+                        df_tracked,
+                        metadata,
+                    )
+            tracked_ok = True
+        finally:
+            if tracked_ok:
+                fov_obj.tracks_queue.put_for_frame(frame_idx, df_tracked)
+            else:
+                fov_obj.tracks_queue.skip_frame(frame_idx)
+            # Skip the stim dispenser only for the StimWithPipeline path —
+            # that's the only path the pipeline puts on. Other paths produce
+            # via storage_worker (StimWithImage) or synchronously in the
+            # controller (base Stim) and have their own failure semantics.
+            if pipeline_will_produce_mask and not stim_mask_put:
+                fov_obj.stim_mask_queue.skip_frame(frame_idx)
 
         # --- Parquet save (after unblocking — doesn't mutate df_tracked) ---
         df_to_save = convert_track_dtypes(df_tracked)
 
-        if (
-            frame_counter % self.only_save_every_n_frames == 0
-            or frame_counter == 0
-        ):
+        if frame_idx % self.only_save_every_n_frames == 0 or frame_idx == 0:
             with fov_obj.parquet_lock:
                 df_to_save.to_parquet(
                     os.path.join(self.storage_path, "tracks", filename_for_parquet),
                     compression="zstd",
                 )
 
+        w = self._writer
         if self.stimulator is not None:
             if metadata["stim"]:
-                store_img(stim_mask, metadata, self.storage_path, "stim_mask")
+                # Store the mask that actually fired at this frame, not the
+                # one just computed for the next frame's "previous"-mode peek.
+                if analyzer_mode == "previous":
+                    fired = fov_obj.stim_mask_queue.peek_at_frame(frame_idx - 1)
+                else:
+                    # "current" (or legacy None): local mask_t for
+                    # StimWithPipeline; storage_worker's put for
+                    # StimWithImage; base Stim's synchronous path.
+                    fired = (
+                        stim_mask
+                        if stim_mask is not None
+                        else fov_obj.stim_mask_queue.peek_at_frame(frame_idx)
+                    )
+                if fired is None:
+                    fired = np.zeros(shape_img, np.uint8)
+                store_img(fired, metadata, self.storage_path, "stim_mask", writer=w)
             else:
                 store_img(
                     np.zeros(shape_img, np.uint8),
                     metadata,
                     self.storage_path,
                     "stim_mask",
+                    writer=w,
                 )
                 store_img(
-                    np.zeros(shape_img, np.uint8), metadata, self.storage_path, "stim"
+                    np.zeros(shape_img, np.uint8),
+                    metadata,
+                    self.storage_path,
+                    "stim",
+                    writer=w,
                 )
+
+        # Prune the stim dispenser — keep only the predecessor (t-1) for a
+        # future "previous"-mode peek and this frame's put (t).
+        fov_obj.stim_mask_queue.prune_below(frame_idx - 1)
 
         if masks_for_fe is not None:
             for mask_fe in masks_for_fe:
                 for key, value in mask_fe.items():
-                    store_img(value, metadata, self.storage_path, key)
+                    store_img(value, metadata, self.storage_path, key, writer=w)
 
         save_segmentation_results(
-            segmentation_results, self.segmentators, self.tracker,
-            df_to_save, metadata, self.storage_path,
+            segmentation_results,
+            self.segmentators,
+            self.tracker,
+            df_to_save,
+            metadata,
+            self.storage_path,
+            writer=w,
         )
 
         return {"result": "STOP"}
