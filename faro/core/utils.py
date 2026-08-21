@@ -663,10 +663,8 @@ def generate_df_acquire(
     )
     timesteps = range(n_frames)
     dfs = []
-    first_fov_index = fovs[0].index
-    for _, fov in enumerate(fovs):
-        fov_index = fov.index
-        fov_group = (fov_index - first_fov_index) // n_fovs_simultaneously
+    for fov_index, fov in enumerate(fovs):
+        fov_group = fov_index // n_fovs_simultaneously
         start_time_fov = start_time + fov_group * time_between_timesteps * len(
             timesteps
         )
