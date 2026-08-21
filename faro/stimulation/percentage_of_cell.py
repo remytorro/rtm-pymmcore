@@ -2,7 +2,8 @@ from .base import StimWithPipeline
 import numpy as np
 import skimage
 import math
-from skimage.morphology import disk
+from skimage.morphology import disk, dilation
+from skimage.measure import regionprops
 
 # import skimage binary_dilation under a local name and provide a scipy fallback
 from skimage.morphology import binary_dilation as skimage_binary_dilation
@@ -116,3 +117,48 @@ class StimPercentageOfCell(StimWithPipeline):
         except Exception as e:
             print(e)
             return np.zeros_like(label_image), None
+
+
+class StimUp(StimWithPipeline):
+    """Illuminate top edge"""
+
+    def __init__(self, fraction=0.2):
+        self.fraction = fraction
+
+    def get_stim_mask(self, label_images, metadata=None, img=None, tracks=None):
+        labels = label_images["labels"]
+        stim_mask = np.zeros(labels.shape, dtype=np.uint8)
+        selem = disk(3)
+
+        if tracks is None or tracks.empty:
+            return stim_mask, None
+
+        # Control FOVs in a region-percentage run share this stimulator but
+        # carry stim_fov=False, so they get an empty mask. A missing key means
+        # "stimulate" -- only an explicitly falsy flag opts a FOV out.
+        if not (metadata or {}).get("stim_fov", True):
+            return stim_mask, None
+
+        current = tracks[tracks["timestep"] == tracks["timestep"].max()]
+        label_to_particle = dict(zip(current["label"], current["particle"]))
+
+        for prop in regionprops(labels):
+            minr, minc, maxr, maxc = prop.bbox
+            pid = label_to_particle.get(prop.label, 0)
+
+            
+            y_cutoff = minr + self.fraction * (maxr - minr)
+            select = lambda rows, c=y_cutoff: rows < c
+
+            cell_mask = labels == prop.label
+            rows, cols = np.where(cell_mask)
+            edge_pixels = select(rows)
+            if not edge_pixels.any():
+                continue
+
+            local = np.zeros_like(labels, dtype=np.uint8)
+            local[rows[edge_pixels], cols[edge_pixels]] = 1
+            local = dilation(local, footprint=selem)
+            stim_mask = np.maximum(stim_mask, local)
+
+        return stim_mask, None
