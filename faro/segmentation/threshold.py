@@ -1,5 +1,5 @@
 import numpy as np
-from rtm_pymmcore.segmentation.base_segmentation import Segmentator
+from faro.segmentation.base import Segmentator, remove_small_objects
 import skimage
 
 class SegmentatorThreshold(Segmentator):
@@ -42,7 +42,9 @@ class SegmentatorThreshold(Segmentator):
         labels = skimage.measure.label(binary)
 
         if self.min_size > 0:
-            labels = skimage.morphology.remove_small_objects(
+            # Use faro's shim, not skimage.morphology directly: scikit-image
+            # 0.26 renamed the size argument and flipped its comparison.
+            labels = remove_small_objects(
                 labels, min_size=self.min_size, connectivity=1
             )
         return labels
