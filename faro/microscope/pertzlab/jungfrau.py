@@ -1,10 +1,6 @@
-import os
-
-LOG_FILE_PATH = "C:\\Users\\Jungfrau\\AppData\\Local\\pymmcore-plus\\pymmcore-plus\\logs\\pymmcore-plus.log"
-if os.path.exists(LOG_FILE_PATH):
-    os.remove(LOG_FILE_PATH)
-
 import pymmcore_plus
+
+pymmcore_plus.configure_logging(file=None, stderr_level="CRITICAL")
 import time
 import weakref
 import logging
@@ -13,27 +9,18 @@ from useq import MDAEvent
 from pymmcore_plus.mda._engine import MDAEngine
 from pymmcore_plus._logger import logger
 
-from rtm_pymmcore.microscope.pymmcore import PyMMCoreMicroscope
+from faro.microscope.pymmcore import PyMMCoreMicroscope
 
 
 class Jungfrau(PyMMCoreMicroscope):
     MICROMANAGER_PATH = "C:\\Program Files\\Micro-Manager-2.0_api74"
-    MICROMANAGER_CONFIG = "E:\\pertzlab_mic_configs\\micromanager\\Jungfrau\\TiFluoroJungfrau_w_TTL_DIGITALIO.cfg"
+    MICROMANAGER_CONFIG = "E:\\pertzlab_mic_configs\\micromanager\\Jungfrau\\TiFluoroJungfrau_w_TTL_NIDAQ.cfg"
     USE_AUTOFOCUS_EVENT = False
     USE_ONLY_PFS = True
-    POWER_PROPERTIES = {
-        "CyanStim": ("Spectra", "Cyan_Level"),
-    }
 
     def __init__(self):
-
         super().__init__()
-        pymmcore_plus.configure_logging(
-            stderr_level="CRITICAL",
-            file_level="CRITICAL",
-            file_rotation=160,
-            file_retention=1,
-        )
+        pymmcore_plus.configure_logging(file=None, stderr_level="CRITICAL")
         pymmcore_plus.use_micromanager(self.MICROMANAGER_PATH)
         self.mmc = pymmcore_plus.CMMCorePlus(self.MICROMANAGER_PATH)
         self.init_scope()
@@ -42,8 +29,6 @@ class Jungfrau(PyMMCoreMicroscope):
         """Initialize the microscope."""
         self.mmc.loadSystemConfiguration(self.MICROMANAGER_CONFIG)
         self.mmc.setConfig(groupName="System", configName="Startup")
-        # Register the MDA engine early so other components using `mmc.mda`
-        # will already have the correct engine registered.
         self.register_engine()
 
     def post_experiment(self):
@@ -55,11 +40,9 @@ class Jungfrau(PyMMCoreMicroscope):
         This is idempotent unless `force=True`. It will attach a weakref to
         this microscope on the engine and register the engine on `self.mmc.mda`.
         """
-        # If engine already exists and caller doesn't want to force, do nothing
         if hasattr(self, "engine") and self.engine is not None and not force:
             return
 
-        # Create the engine and attach this microscope (weakref)
         self.engine = JungfrauMDAEngine(self.mmc)
         try:
             self.engine.attach_microscope(self)
@@ -68,7 +51,6 @@ class Jungfrau(PyMMCoreMicroscope):
                 "Failed to attach microscope to engine"
             )
 
-        # Register it on the MDARunner so acquisitions use it
         try:
             self.mmc.mda.set_engine(self.engine)
         except Exception:

@@ -1,9 +1,9 @@
 import threading
 import time
 import requests
-from rtm_pymmcore.microscope.pymmcore import PyMMCoreMicroscope
+from faro.microscope.pymmcore import PyMMCoreMicroscope
 import pymmcore_plus
-from rtm_pymmcore.core.dmd import DMD
+from faro.core.dmd import DMD
 
 
 class WakeUpLaser:
@@ -46,13 +46,6 @@ class Niesen(PyMMCoreMicroscope):
     POWER_PROPERTIES = {
         "CyanStim": ("LedDMD", "Cyan_Level"),
     }
-    DMD_CALIBRATION_PROFILE = {
-        "channel_group": "WF_DMD",
-        "channel_config": "CyanStim",
-        "device_name": "LedDMD",
-        "property_name": "Cyan_Level",
-        "power": 100,
-    }
 
     def __init__(self, affine_calibration_matrix=None, fast_init=False):
         super().__init__()
@@ -65,7 +58,7 @@ class Niesen(PyMMCoreMicroscope):
         self.init_scope()
         self.dmd = DMD(
             self.mmc,
-            self.DMD_CALIBRATION_PROFILE,
+            resolve_power=self.resolve_power,
             affine_matrix=affine_calibration_matrix,
         )
         self.slm_dev = None
@@ -86,6 +79,7 @@ class Niesen(PyMMCoreMicroscope):
 
     def calibrate_dmd(
         self,
+        calibration_channel,
         verbose=False,
         n_points=15,
         radius=4,
@@ -93,9 +87,10 @@ class Niesen(PyMMCoreMicroscope):
         marker_style="x",
         calibration_points_DMD=None,
     ):
-        "Calibrate the DMD if it is not already calibrated." ""
-        if self.dmd is not None and self.dmd.affine is None:
+        """Calibrate the DMD. Always runs the calibration when called."""
+        if self.dmd is not None:
             self.dmd.calibrate(
+                calibration_channel,
                 verbose=verbose,
                 n_points=n_points,
                 radius=radius,
@@ -107,3 +102,23 @@ class Niesen(PyMMCoreMicroscope):
     def post_experiment(self):
         """Post-process the experiment."""
         self.wl.stop()
+
+    def shutdown(self):
+        """Tear down hardware state so the microscope can be discarded.
+
+        Stops the wake-up-laser keepalive thread and unloads all
+        Micro-Manager devices so COM ports and the SLM handle are
+        released. Without this, pymmcore's native threads keep the
+        Python process alive after the main thread exits, leaving a
+        zombie that blocks the next session.
+        """
+        wl = getattr(self, "wl", None)
+        if wl is not None:
+            try:
+                wl.stop()
+            except Exception:
+                pass
+        try:
+            self.mmc.unloadAllDevices()
+        except Exception:
+            pass

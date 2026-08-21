@@ -1,13 +1,25 @@
 from __future__ import annotations
 
 import os
+import warnings
 from collections.abc import Callable, Iterator
 from threading import Thread
+
+# Silence the FutureWarning from napari-micromanager importing deprecated pymmcore_plus.mda.handlers
+warnings.filterwarnings(
+    "ignore",
+    message="The 'pymmcore_plus.mda.handlers' module is deprecated",
+    category=FutureWarning,
+)
+
+# PYMM_SIGNALS_BACKEND is hard-set to 'psygnal' in faro/__init__.py before any
+# submodule (including this one) is imported. A setdefault here would be a
+# no-op anyway: pymmcore_widgets pre-empts to 'qt' whenever it imports first.
 
 import numpy as np
 from useq import MDAEvent
 
-from rtm_pymmcore.core.dmd import DMD
+from faro.core.dmd import DMD
 
 
 class AbstractMicroscope:
@@ -69,20 +81,58 @@ class AbstractMicroscope:
     def validate_hardware(self, events) -> bool:
         """Validate events against hardware capabilities.
 
-        Base implementation is a no-op (returns True). Subclasses override
-        to check channel configs, exposure limits, device properties, etc.
+        Base implementation only runs the DMD calibration check; subclasses
+        compose extra checks (channel configs, exposure limits, device
+        properties, etc.) by calling ``super().validate_hardware(events)``.
         """
-        return True
+        return self._validate_dmd_calibration(events)
+
+    def _validate_dmd_calibration(self, events) -> bool:
+        """Warn if events contain stim but the DMD isn't calibrated.
+
+        Skipped when the microscope has no DMD or the events have no
+        stim channels — non-DMD setups and non-stim experiments don't
+        need it. Without this check, the failure surfaces deep in the
+        first stim event as ``DMD.affine_transform`` raising
+        ``ValueError("DMD not calibrated...")``.
+        """
+        if self.dmd is None:
+            return True
+        if getattr(self.dmd, "affine", None) is not None:
+            return True
+        if not any(getattr(ev, "stim_channels", ()) for ev in events):
+            return True
+        warnings.warn(
+            "DMD not calibrated (affine matrix is None) but events contain "
+            "stim channels. Run mic.calibrate_dmd() before starting the "
+            "experiment.",
+            UserWarning,
+        )
+        return False
 
     # ------------------------------------------------------------------
     # DMD
     # ------------------------------------------------------------------
 
-    def calibrate_dmd(self):
-        "Calibrate the DMD if it is not already calibrated." ""
-        if isinstance(self.dmd, DMD) and self.dmd.affine is None:
-            self.dmd.calibrate()
+    def calibrate_dmd(self, calibration_channel):
+        """Calibrate the DMD. Always runs the calibration when called."""
+        if isinstance(self.dmd, DMD):
+            self.dmd.calibrate(calibration_channel)
 
     def post_experiment(self):
         """Post-process the experiment. Optional override."""
+        pass
+
+    def shutdown(self):
+        """Release all hardware resources held by this microscope.
+
+        Unlike :meth:`post_experiment` (which runs *between* experiments
+        and may keep devices warm for the next run), ``shutdown`` signals
+        that this microscope instance is being discarded. Subclasses
+        should stop any background threads (DMD wakeup loops, etc.) and
+        unload devices so that COM ports / SLM handles are released and
+        the Python process can exit cleanly.
+
+        Base implementation is a no-op; subclasses override as needed.
+        """
         pass
