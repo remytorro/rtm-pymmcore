@@ -194,3 +194,9 @@ tests/hardware/*/.preflight.json
 # NB: this used to be a blanket `inscoper*`, which also swallowed
 # faro/microscope/Inscoper.py -- the adapter belongs in the repo.
 *.lic
+# Byproducts of running a notebook: the Inscoper bridge writes its C++ API log
+# under <cwd>/logs/ and faro appends per-run timings to <cwd>/performance.csv,
+# so every experiment folder a notebook is launched from grows both. Per-machine
+# and per-run; nothing to commit.
+logs/
+performance.csv
