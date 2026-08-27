@@ -45,12 +45,13 @@ mic.mmc.snapImage()
 test_img = mic.mmc.getImage()
 print(f"Camera: {test_img.shape[1]}x{test_img.shape[0]}, dtype={test_img.dtype}")
 
-# Frames arrive as int64 from this bridge -- 8 bytes per pixel for 16-bit
-# camera data. TiffWriter preserves that dtype (the raw files below really are
-# int64), so the files are four times larger than they need to be; OmeZarrWriter
-# instead casts to its `dtype=` argument, which defaults to uint16 and would
-# wrap silently on a value above 65535. Worth checking the range once for a
-# given exposure rather than assuming either behaviour.
+# Frames arrive as uint16 since 2026-08-27. They used to be int64 -- 8 bytes
+# per pixel for 16-bit camera data -- because the SWIG fallback in the bridge's
+# `_fast_vector_to_array` iterated Python ints; TiffWriter preserved that dtype
+# and wrote files four times larger than they needed to be, and the uint16
+# OME-Zarr store rejected the frame outright. Both ends were fixed: the bridge
+# casts, and OmeZarrWriter.write() coerces to the store dtype (clipping, not
+# wrapping). The range is still worth a look before a long run.
 print(f"Range : {test_img.min()} .. {test_img.max()}  "
       f"({'fits uint16' if test_img.max() <= 65535 else 'WOULD OVERFLOW uint16'})")
 

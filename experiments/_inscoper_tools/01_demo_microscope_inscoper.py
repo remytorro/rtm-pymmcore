@@ -27,8 +27,12 @@
 #    not fail at construction — it fails inside `init_stream`, *after* the run
 #    has already started, as the run's `fatal_error`. `site.make_writer()` and
 #    `site.make_segmentator()` decide up front and print what they chose.
-# 4. **Frames arrive as `int64`** and `getPixelSizeUm()` answers `0.0`, so
-#    anything deriving a field of view from the pixel size gets zero.
+# 4. **`getPixelSizeUm()` answers `0.0`**, so anything deriving a field of
+#    view from the pixel size gets zero. Frames used to arrive as `int64` as
+#    well -- the SWIG fallback in `_fast_vector_to_array` iterated Python ints
+#    -- which the uint16 OME-Zarr store refused ("Cannot cast array data from
+#    dtype('int64') to dtype('uint16')"), losing every frame to a background
+#    storage error. That fallback now returns `uint16`.
 
 # %% [markdown]
 # ## 1. Connect to the microscope

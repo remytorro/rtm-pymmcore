@@ -62,9 +62,11 @@ test_img = mic.mmc.getImage()
 print(f"Camera: {test_img.shape[1]}x{test_img.shape[0]}, dtype={test_img.dtype}")
 print(f"Range : {test_img.min()} .. {test_img.max()}")
 
-# The bridge hands out int64 frames; OmeZarrWriter casts to its `dtype`
-# argument, which defaults to uint16. A value above 65535 would wrap silently,
-# so the range above is worth a look before committing a long run.
+# OmeZarrWriter stores its `dtype` argument, which defaults to uint16, and
+# coerces every incoming frame to it -- clipping, so a value above 65535
+# saturates instead of wrapping. The bridge now hands out uint16 directly
+# (it used to hand out int64, which the store refused). The range above is
+# still worth a look before committing a long run.
 assert test_img.max() <= 65535, (
     f"peak {test_img.max()} exceeds uint16 — pass dtype='uint32' to "
     "OmeZarrWriter or shorten the exposure"

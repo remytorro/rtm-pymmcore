@@ -473,10 +473,18 @@ class OmeZarrWriter:
 
         dimensions = []
 
-        # Time (unbounded OK — it's the first dimension)
+        # Time is declared unbounded even when the run length is known.
+        # ome-writers stops an append past a *declared* count with
+        # "Cannot append frame: would exceed total of N frames", and the
+        # Controller's continue_experiment() (a second acquisition phase
+        # against the same writer) appends exactly that way — every frame of
+        # every later phase was landing in a background storage error instead
+        # of the store. An unbounded leading dimension grows on append; the
+        # pre-sizing rationale in _init_stream_direct is about the *direct*
+        # arrays' zarr.json churn and does not apply here.
         t_kwargs: dict = dict(
             name="t",
-            count=self._n_timepoints,
+            count=None,
             chunk_size=self._raw_chunk_t,
             type="time",
         )
@@ -666,7 +674,29 @@ class OmeZarrWriter:
     # Public API
     # ------------------------------------------------------------------
 
+    def _as_store_dtype(self, img: np.ndarray) -> np.ndarray:
+        """Coerce a pixel frame to the dtype the raw array was created with.
+
+        Acquisition backends do not always hand us the dtype we sized the
+        store for — the Inscoper bridge's SWIG fallback path, for one, yields
+        int64 — and neither zarr nor tensorstore will perform the narrowing
+        cast themselves ("Cannot cast array data from dtype('int64') to
+        dtype('uint16') according to the rule 'safe'"), so the frame is lost
+        to a background storage error. The values are camera counts that fit
+        the store dtype, so clip (a stray out-of-range value should saturate,
+        not wrap) and cast.
+        """
+        target = np.dtype(self._dtype)
+        if img.dtype == target:
+            return img
+        if np.issubdtype(target, np.integer):
+            info = np.iinfo(target)
+            img = np.clip(img, info.min, info.max)
+        return img.astype(target, copy=False)
+
     def write(self, img: np.ndarray, metadata: dict, folder: str) -> None:
+        if folder in ("raw", "stim", "ref"):
+            img = self._as_store_dtype(img)
         with self._write_lock:
             last_err: Exception | None = None
             for attempt in range(_WRITE_RETRY_ATTEMPTS):
@@ -1092,10 +1122,12 @@ class OmeZarrWriterPlate(OmeZarrWriter):
 
         dimensions = []
 
-        # Time (unbounded OK — positions are handled via plate, not as first dim)
+        # Time unbounded — positions are handled via plate, not as first dim,
+        # and a declared count would make a continue_experiment() phase
+        # overflow the stream (see _init_stream_ome_writers).
         t_kwargs: dict = dict(
             name="t",
-            count=self._n_timepoints,
+            count=None,
             chunk_size=self._raw_chunk_t,
             type="time",
         )
