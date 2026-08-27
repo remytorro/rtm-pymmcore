@@ -26,9 +26,9 @@
 # ## 0. Is the OME-Zarr path available?
 #
 # `OmeZarrWriterPlate` inherits from `OmeZarrWriter` and needs the same
-# `ome_writers` package — and fails the same way without it: inside
-# `init_stream`, *after* `run_experiment` has started, as the run's
-# `fatal_error`.
+# `ome_writers` package — installed here on 2026-08-26 — and fails the same way
+# without it: not at construction, but inside `init_stream`, *after*
+# `run_experiment` has started, as the run's `fatal_error`.
 
 # %%
 import os

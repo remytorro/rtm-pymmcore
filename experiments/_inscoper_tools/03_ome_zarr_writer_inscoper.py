@@ -7,16 +7,17 @@
 #
 # Site configuration lives in `../inscoper_site.py`.
 #
-# > **`ome_writers` is not installed in the `py313` environment this microscope
-# > runs in.** `pyproject.toml` declares it, but it is absent, and
-# > `OmeZarrWriter` does not fail at construction — it fails inside
+# > **This notebook needs `ome_writers`, which was missing until 2026-08-26.**
+# > `pyproject.toml` declares the package, but the `py313` environment did not
+# > have it, and the absence did not present as an import error you could act
+# > on: `OmeZarrWriter` constructs fine without it and fails inside
 # > `init_stream`, i.e. **after `run_experiment` has already started**, with a
-# > bare `ModuleNotFoundError` that surfaces as the run's `fatal_error`. Nothing
-# > is acquired, and the traceback names neither the writer nor the package.
+# > bare `ModuleNotFoundError` surfacing as the run's `fatal_error`. Nothing is
+# > acquired, and the traceback names neither the writer nor the package.
 # >
-# > The next cell checks for it and stops with an install line rather than
-# > letting you find out that way. `03_tiff_writer_inscoper.ipynb` is the
-# > variant that runs as-is today.
+# > It is installed now and this notebook runs. Cell 0 still checks, because the
+# > next machine will not have it either — and `tiff_writer_inscoper.ipynb`
+# > covers the same ground with no extra dependency.
 
 # %% [markdown]
 # ## 0. Is the OME-Zarr path available at all?

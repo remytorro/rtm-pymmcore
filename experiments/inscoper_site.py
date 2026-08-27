@@ -48,10 +48,14 @@ and is *wrong*:
    small offsets from wherever the stage already is.
 
 5. **The environment is not the one ``pyproject.toml`` describes.**
-   ``ome_writers`` and ``cellpose`` are absent from the ``py313`` env this
-   microscope runs in, and ``OmeZarrWriter`` fails at ``init_stream`` --
-   i.e. *after* ``run_experiment`` has started. :func:`make_writer` and
-   :func:`make_segmentator` choose up front and say what they chose.
+   ``ome_writers`` was declared but absent until it was installed on
+   2026-08-26; ``cellpose`` still is, along with ``imageio-ffmpeg`` and
+   ``napari-ome-zarr``. The pattern matters more than the list, because
+   ``OmeZarrWriter`` did not fail at construction: it failed inside
+   ``init_stream``, i.e. *after* ``run_experiment`` had started, as the
+   run's ``fatal_error``. :func:`make_writer` and :func:`make_segmentator`
+   decide up front and say what they chose, so a missing package costs a
+   printed line instead of an acquisition.
 """
 
 from __future__ import annotations
@@ -660,12 +664,17 @@ def goto_good_field(mic, *, verbose: bool = True) -> None:
 def make_writer(path: str, **kwargs):
     """``OmeZarrWriter`` when it can be built, else ``TiffWriter``.
 
-    ``OmeZarrWriter`` needs the ``ome_writers`` package, which
-    ``pyproject.toml`` declares but the ``py313`` environment this
-    microscope runs in does not have. It fails inside ``init_stream`` --
-    i.e. after ``run_experiment`` has started -- and surfaces as the run's
-    ``fatal_error``, so nothing is acquired. Choosing here makes the
-    fallback a printed line instead of a dead acquisition.
+    ``ome_writers`` **is** installed in the ``py313`` environment as of
+    2026-08-26 -- it was missing until then, which is why this function
+    exists -- so the OME-Zarr path is the one taken. The fallback stays
+    because of *how* the absence used to present: ``OmeZarrWriter``
+    constructs fine without the package and fails inside ``init_stream``,
+    i.e. **after** ``run_experiment`` has started, surfacing as the run's
+    ``fatal_error`` with a bare ``ModuleNotFoundError`` that names neither
+    the writer nor the package. Nothing is acquired.
+
+    Deciding here turns that into a printed line and a working run on any
+    environment that has not had the package added yet.
     """
     from faro.core.writers import TiffWriter
 

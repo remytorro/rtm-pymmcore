@@ -141,9 +141,11 @@ assert plan is not None, (
 #
 # Same components as the original, with two substitutions the environment
 # forces: `site.make_segmentator()` (cellpose is not installed here) and
-# `site.make_writer()` (`ome_writers` is not installed, and `OmeZarrWriter`
-# fails *inside* `init_stream` — after the run has started — so choosing up
-# front is the difference between a printed line and a dead acquisition).
+# `site.make_writer()`, which picks `OmeZarrWriter` when `ome_writers` is
+# importable and `TiffWriter` otherwise. That choice is made up front because
+# `OmeZarrWriter` constructs fine without the package and fails *inside*
+# `init_stream` — after the run has started — which is the difference between
+# a printed line and a dead acquisition.
 
 # %%
 from faro.stimulation.base import StimWholeFOV

@@ -21,12 +21,14 @@
 #    `stage_positions=[{"x": 0, "y": 0, "z": 0}]` would drive this stage to the
 #    machine origin — a full-travel move off your sample. `site.at(mic)` reads
 #    the stage and stays there.
-# 3. **`ome_writers` is not installed in this environment**, so `OmeZarrWriter`
-#    fails inside `init_stream` — after the run has already started.
-#    `site.make_writer` picks `TiffWriter` up front and says so.
-# 4. **`cellpose` is not installed either.** This notebook segments with Otsu
-#    anyway (as the original does), so it does not matter here, but
-#    `site.make_segmentator()` is the fallback the stim notebooks use.
+# 3. **The environment is not the one `pyproject.toml` describes.**
+#    `ome_writers` was declared but missing until it was installed on
+#    2026-08-26; `cellpose` still is. That matters because `OmeZarrWriter` does
+#    not fail at construction — it fails inside `init_stream`, *after* the run
+#    has already started, as the run's `fatal_error`. `site.make_writer()` and
+#    `site.make_segmentator()` decide up front and print what they chose.
+# 4. **Frames arrive as `int64`** and `getPixelSizeUm()` answers `0.0`, so
+#    anything deriving a field of view from the pixel size gets zero.
 
 # %% [markdown]
 # ## 1. Connect to the microscope

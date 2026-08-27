@@ -7,14 +7,17 @@
 #
 # Site configuration lives in `../inscoper_site.py`.
 #
-# **On this installation `TiffWriter` is not a demo choice — it is the only
-# writer that works.** `OmeZarrWriter` needs the `ome_writers` package, which
-# `pyproject.toml` declares but the `py313` environment does not have, and it
-# fails *inside* `init_stream` — after `run_experiment` has already started —
-# with a bare `ModuleNotFoundError` that surfaces as the run's `fatal_error`.
-# Nothing is acquired. `site.make_writer()` chooses up front so the fallback is a
-# printed line rather than a dead acquisition; this notebook asks for
-# `TiffWriter` explicitly.
+# **Why `TiffWriter` still matters here.** `OmeZarrWriter` needs the
+# `ome_writers` package, which `pyproject.toml` declares but the `py313`
+# environment did not have until it was installed on 2026-08-26 — see
+# `ome_zarr_writer_inscoper.ipynb`, which now runs. The failure mode is the
+# reason `TiffWriter` remains the safe default on a fresh machine:
+# `OmeZarrWriter` constructs fine without the package and fails *inside*
+# `init_stream`, after `run_experiment` has already started, with a bare
+# `ModuleNotFoundError` surfacing as the run's `fatal_error`. Nothing is
+# acquired, and the traceback names neither the writer nor the package.
+# `site.make_writer()` decides up front; this notebook asks for `TiffWriter`
+# explicitly.
 
 # %% [markdown]
 # ## 1. Connect to the microscope

@@ -22,10 +22,10 @@ against the `useq_compat` harness (`inscoper_useq/scripts/useq_compat/_harness.p
 |---|---|---|
 | `01_demo_microsocpe/demo_microscope.ipynb` | `demo_microscope_inscoper.ipynb` | run end to end on hardware |
 | `02_demo_sim_optogenetic/demo_sim_optogenetic.ipynb` | `demo_sim_optogenetic_inscoper.ipynb` | run end to end on hardware |
-| `02_.../demo_sim_optogenetic_napari_async.ipynb` | `demo_sim_optogenetic_napari_async_inscoper.ipynb` | *pending* |
-| `03_demo_writer_implementation/tiff_writer.ipynb` | `tiff_writer_inscoper.ipynb` | *pending* |
-| `03_.../ome_zarr_writer.ipynb` | `ome_zarr_writer_inscoper.ipynb` | *pending* |
-| `03_.../ome_zarr_writer_plate.ipynb` | `ome_zarr_writer_plate_inscoper.ipynb` | *pending* |
+| `02_.../demo_sim_optogenetic_napari_async.ipynb` | `demo_sim_optogenetic_napari_async_inscoper.ipynb` | run end to end on hardware |
+| `03_demo_writer_implementation/tiff_writer.ipynb` | `tiff_writer_inscoper.ipynb` | run end to end on hardware |
+| `03_.../ome_zarr_writer.ipynb` | `ome_zarr_writer_inscoper.ipynb` | run end to end on hardware |
+| `03_.../ome_zarr_writer_plate.ipynb` | `ome_zarr_writer_plate_inscoper.ipynb` | run end to end on hardware |
 | `03_.../convert_tiff_to_omezarr.ipynb` | — | no microscope; nothing to port |
 | `11_.../stim_rtmsequence.ipynb` | `stim_rtmsequence_inscoper.ipynb` | run end to end on hardware |
 | `11_.../stim_dfacquire.ipynb` | `stim_dfacquire_inscoper.ipynb` | run end to end on hardware |
@@ -40,9 +40,11 @@ against the `useq_compat` harness (`inscoper_useq/scripts/useq_compat/_harness.p
 | `90_reanalysis/reanalysis.ipynb` | — | offline by design |
 
 "Run end to end on hardware" means every code cell was executed against the
-live microscope, with the time plans shortened, using
-`scratchpad/nbtest.py` — a cell-by-cell runner with napari stubbed. Frames were
-acquired, masks were fired, tracks were written.
+live microscope on 2026-08-26, with the time plans shortened, using
+[`_inscoper_tools/nbtest.py`](_inscoper_tools/nbtest.py) — a cell-by-cell runner
+with napari stubbed. Frames were acquired, masks were fired, tracks were
+written. What is *not* claimed: no biological response was measured. Every burn
+so far has been aimed and priced, not dosed — see "What is still open" below.
 
 ---
 
@@ -150,13 +152,18 @@ millimetres; anything outside 100–10,000 µm is a µm/nm mix-up) and falls bac
 
 ### 5. The environment is not the one `pyproject.toml` describes
 
-The `py313` conda env this microscope runs in is missing three packages the
-originals assume:
+The `py313` conda env this microscope runs in was missing four packages the
+originals assume. The **pattern** matters more than the list, because none of
+them failed at import time where you could act on it:
 
-* **`ome_writers`** — `OmeZarrWriter` fails inside `init_stream`, i.e. *after*
-  `run_experiment` has started, surfacing as the run's `fatal_error` with a bare
-  `ModuleNotFoundError`. Nothing is acquired. `site.make_writer()` picks
-  `TiffWriter` up front and prints why.
+* **`ome_writers`** — declared in `pyproject.toml`, absent until it was
+  **installed on 2026-08-26** as part of this work. `OmeZarrWriter` constructs
+  fine without it and fails inside `init_stream`, i.e. *after* `run_experiment`
+  has started, surfacing as the run's `fatal_error` with a bare
+  `ModuleNotFoundError` that names neither the writer nor the package. Nothing
+  is acquired. `site.make_writer()` decides up front and prints what it chose;
+  it now returns `OmeZarrWriter`, and still falls back on a machine without the
+  package.
 * **`cellpose`** — `site.make_segmentator()` falls back to
   `SegmentatorThreshold(threshold=0.1)`. Pass `multichannel=True` when
   `use_channel` is a *list*: Cellpose reduces a `(C, Y, X)` stack itself, the
@@ -168,8 +175,23 @@ originals assume:
   keyword argument 'fps'`, naming neither the format nor the missing package.
   The movie cell falls back to GIF.
 
-Also absent: the pertzlab StarDist server (`izbniesen.izb.unibe.ch:8001`) and
-the `virtual_microscope` package.
+* **`napari-ome-zarr`** — declared, absent. Does not block acquisition; it is
+  the napari reader for the stores `OmeZarrWriter` writes, so without it the
+  output has to be opened with `zarr` directly (which the writer notebooks do).
+
+Also absent: the pertzlab StarDist server (`izbniesen.izb.unibe.ch:8001`, not
+reachable from here) and the `virtual_microscope` package.
+
+To get the full set:
+
+```
+conda activate py313
+pip install ome-writers napari-ome-zarr cellpose imageio-ffmpeg
+```
+
+`ome-writers` was installed and the environment re-checked afterwards
+(`useq`, `pydantic` 2.11.9, `zarr` 3.1.5, `inscoper_api`, `faro`, `napari` all
+still import; `useq` still enumerates). The other three are untested here.
 
 ---
 
@@ -306,7 +328,24 @@ To run a whole notebook headless, with napari stubbed and the time plans
 shortened:
 
 ```
-python scratchpad/nbtest.py <source.py> N_FRAMES=6 USE_GUI_FOVS=False
+python _inscoper_tools/nbtest.py     _inscoper_tools/21_cell_migration_inscoper.py     N_FRAMES=6 TIME_BETWEEN_TIMESTEPS=8 USE_GUI_FOVS=False
+```
+
+It runs each `# %%` cell in order in one namespace, prints what the notebook
+itself printed (the C++ log spam is filtered), and reports `n/N cells ok`. Each
+`NAME=VALUE` argument rewrites a top-level `NAME = ...` assignment before the
+run, which is how a 120-frame experiment becomes a 6-frame smoke test without
+editing the notebook.
+
+### Editing a notebook
+
+The `.ipynb` files are **generated**. Each one has its source next to it in
+[`_inscoper_tools/`](_inscoper_tools) as an annotated `.py` (`# %%` /
+`# %% [markdown]`), which is what to edit — it reviews as a diff, and
+`nbtest.py` runs it directly. Regenerate with:
+
+```
+python _inscoper_tools/py2nb.py     _inscoper_tools/21_cell_migration_inscoper.py     21_cell_migration/cell_migration_inscoper.ipynb
 ```
 
 ---
@@ -336,3 +375,53 @@ Constants: `CONFIG_DIR`, `CHANNELS_DIR`, `CAMERA_NAME`, `CHANNEL_GROUP`,
 (36,000), `INTERPOINT_DISTANCE_PX` (4), `MAX_FULL_FIELD_PX` (352),
 `FULL_FOV_NOTE`. Each is overridable by environment variable — see the
 docstrings.
+
+---
+
+## What is still open
+
+Written down because each is a real gap, not a rough edge, and because "the
+notebook runs" is a much weaker claim than "the experiment works".
+
+**Dose is unverified.** Every burn in this work was aimed and priced, never
+measured. All the pixel evidence is about *where* the light went; none is about
+*how much*. A bleach curve on a fluorescent sample is the missing measurement,
+and until it exists no notebook here can honestly report a dose-response.
+
+**Repetitions cannot be reached through faro.** The dose knob the FRAP path
+actually has is `metadata["frap"]["repetitions"]`, which the bridge honours.
+faro's stimulation transport is `SLMImage(data, device, exposure)` — see
+`faro/core/_useq_compat.py` and `Controller._build_stim_slm` — and has no field
+for it. Consequences:
+
+* `stim_exposure` / `stim_power` are bookkeeping on this microscope. They are
+  written into `exp_data.parquet` and reach nothing.
+* A pulse-width ramp is inexpressible. `stim_ramp_dfacquire_inscoper.ipynb`
+  ramps *frequency* instead and names its treatments accordingly, which is a
+  different perturbation (same peak, different duty cycle) — deliberately, and
+  labelled so, rather than a ramp that silently does not ramp.
+
+Adding an optional `repetitions` to the faro→bridge transport is the change
+that would close this, and it is small: the bridge side already exists.
+
+**`stim_mask/` is not written when a pipeline has no segmentator.** Masks are
+stored by the analysis worker, which only runs when there is something to
+segment. `line_stimulation_inscoper.ipynb` verifies its sweep from `stim/`
+readout frames instead. Worth fixing upstream — the mask exists, it is simply
+not on the path that stores it.
+
+**Whole-field stimulation costs a field.** The `11_*` notebooks crop to 256 px
+so `StimWholeFOV` fits one fire. Splitting a large region across several fires
+would restore the full frame at the cost of scan time, and `plan_mask` already
+refuses in a way that says so; nothing implements the split yet.
+
+**One microscope, one sample.** Every number here — the 4 px pitch, the 352 px
+ceiling, the focus, the channel list — is this installation on 2026-08-26.
+`inscoper_site.py` is the file to re-read on another rig, and `describe(mic)`
+prints what a fresh machine actually reports.
+
+**Untested substitutions.** `cellpose`, `imageio-ffmpeg` and `napari-ome-zarr`
+are still absent, so `site.make_segmentator()` has only ever been exercised on
+its threshold fallback, and the multi-channel path (`ProjectedSegmentator`,
+which max-projects) is a stand-in for Cellpose's own channel handling, not an
+equivalent to it.
