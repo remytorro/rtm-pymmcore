@@ -61,6 +61,7 @@ and is *wrong*:
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -808,10 +809,47 @@ def open_napari(mic, *, title: str | None = None):
     from napari_micromanager import MainWindow
 
     viewer = napari.Viewer(title=title or "Inscoper")
-    mm_wdg = MainWindow(viewer)
+    with _z_moves_disarmed(mic.mmc):
+        mm_wdg = MainWindow(viewer)
     mm_wdg._mmc = mic.mmc
     viewer.window.add_dock_widget(mm_wdg)
     return viewer, mm_wdg
+
+
+@contextmanager
+def _z_moves_disarmed(mmc):
+    """Swallow focus commands for the duration of the block.
+
+    ``pymmcore-widgets``' objective widget lowers the focus to 0 before an
+    objective change and restores it afterwards (``_pre_change_hook`` /
+    ``_post_change_hook`` in ``control/_objective_widget.py``). Building the
+    widget calls ``setCurrentText``, which fires ``_on_combo_changed`` as
+    though the objective had changed, so *opening napari* commands
+    ``focus -> 0 -> previous``.
+
+    That was invisible until 2026-08-27, because ``UseqBridge.setZPosition``
+    staged the value and nothing moved. Now that the bridge drives the axis
+    through a ``DEVICE_UPDATE`` recipe, the same startup would rack the
+    objective through full travel and back with a sample in place. The
+    objective is not changing here, so neither should the focus.
+
+    A real objective change from the widget still gets its protective move:
+    this only covers window construction.
+    """
+    original = mmc.setZPosition
+
+    def _refuse(val, *args, **kwargs):
+        print(
+            f"[inscoper_site] ignored a focus move to {val} um issued while "
+            "the napari window was being built (objective-widget startup "
+            "artefact, not a real objective change)"
+        )
+
+    mmc.setZPosition = _refuse
+    try:
+        yield
+    finally:
+        mmc.setZPosition = original
 
 
 def relink_napari(viewer, mic):
