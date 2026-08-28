@@ -594,8 +594,21 @@ def fovs_here(mic, n: int = 1, step_um: float = 0.0) -> list:
 
     ``step_um`` defaults to 0, i.e. every FOV is the same field. That is
     deliberate for a rehearsal: it exercises the multi-position axis without
-    moving the stage off the field you focused on. Pass a real step (the FOV
-    width) when you want distinct fields.
+    moving the stage off the field you focused on. Pass a real step when you
+    want distinct fields -- the notebooks use 150 um, because
+    ``getPixelSizeUm()`` answers 0.0 on this bridge and the FOV width cannot
+    be derived from it.
+
+    A step now actually moves the stage. Until 2026-08-28 it could not:
+    ``xAxis`` and ``yAxis`` declare no ``Min`` in ``InterfaceFile.json`` (the
+    only two axes in this configuration that do not -- ``Focus`` declares
+    ``-500000``/``1e7``, which is why only XY was affected), and
+    ``InscoperDeviceManagerV2.get_min_max`` started ``driver_min`` at
+    ``+inf`` where IIS starts at ``-Double.MAX_VALUE``, so
+    ``max(driver_min, config_min)`` came back ``+inf`` and
+    ``NumberDevice.convert_value`` clamped every XY target to
+    ``Double.MAX_VALUE``. A stepped FOV list acquired one field *n* times.
+    So ``step_um=0`` is a choice again, not the only honest value.
     """
     from faro.core.utils import FovPosition
 
@@ -835,6 +848,14 @@ def _z_moves_disarmed(mmc):
 
     A real objective change from the widget still gets its protective move:
     this only covers window construction.
+
+    The XY clamp fixed on 2026-08-28 does not retire this guard, and it is
+    worth saying why: that fix was in ``get_min_max``, and it only mattered
+    for sub-devices whose driver reports no minimum. ``Focus`` reports real
+    limits, so focus commands were never clamped -- the widget's
+    ``focus -> 0 -> previous`` would travel the full drive. Patching this one
+    name is enough because the widget calls ``setPosition(zdev, 0)`` and
+    ``UseqBridge.setPosition`` routes straight to ``setZPosition``.
     """
     original = mmc.setZPosition
 

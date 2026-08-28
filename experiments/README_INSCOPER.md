@@ -324,6 +324,15 @@ Each notebook has a `USE_GUI_FOVS = True` switch. Set it `False` to use
 `site.fovs_here(mic, n)` — *n* copies of the field the stage is on now — which
 exercises the multi-position axis without moving off your sample.
 
+For a rehearsal on *distinct* fields, pass a step:
+`site.fovs_here(mic, 2, step_um=150)`. That only became meaningful on
+2026-08-28: `xAxis`/`yAxis` are the only axes in this configuration that
+declare no `Min`, `InscoperDeviceManagerV2.get_min_max` started `driver_min`
+at `+inf` instead of `-Double.MAX_VALUE`, and every XY target was therefore
+clamped to `Double.MAX_VALUE` — so before that a stepped list acquired one
+field *n* times. The focus drive declares real limits, which is why z was
+never affected.
+
 To run a whole notebook headless, with napari stubbed and the time plans
 shortened:
 
