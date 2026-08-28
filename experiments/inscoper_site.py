@@ -60,11 +60,51 @@ and is *wrong*:
 
 from __future__ import annotations
 
+import faulthandler
 import os
 from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
+
+# -- Crash capture ----------------------------------------------------------
+
+
+def _enable_faulthandler() -> None:
+    """Write every thread's Python stack to ``faulthandler.log`` on a hard crash.
+
+    This lives at import time on purpose. The kernel has died three times with
+    three different native exit codes (0xC0000374 heap corruption, 0xC0000409
+    fastfail, 0xC0000005 access violation), and the one run where it would have
+    mattered produced an empty log because the notebook cell that called
+    ``faulthandler.enable()`` was never executed in that kernel. A hand-run cell
+    is the wrong place for a crash handler; importing this module is something
+    every ``*_inscoper`` notebook already does.
+
+    The file is kept open for the life of the process -- faulthandler dups the
+    descriptor and writes to it directly from the faulting thread, so nothing is
+    buffered in Python and nothing is lost on a hard kill. Set
+    ``INSCOPER_NO_FAULTHANDLER=1`` to skip it.
+
+    Caveat worth knowing: a ``__fastfail`` (0xC0000409) bypasses handlers
+    entirely, so this file stays empty for that failure mode. Only an attached
+    debugger sees those.
+    """
+    if os.environ.get("INSCOPER_NO_FAULTHANDLER"):
+        return
+    if faulthandler.is_enabled():
+        return
+    try:
+        path = Path(os.getcwd()) / "faulthandler.log"
+        # Not closed deliberately: it must outlive this function.
+        fh = open(path, "w", buffering=1)  # noqa: SIM115
+        faulthandler.enable(file=fh, all_threads=True)
+    except OSError as exc:  # a read-only cwd must not stop a notebook
+        print(f"[inscoper_site] faulthandler not enabled: {exc}")
+
+
+_enable_faulthandler()
+
 
 # -- Installation constants -------------------------------------------------
 
@@ -775,21 +815,49 @@ def make_segmentator(*, multichannel: bool = False, **kwargs):
         failure -- it surfaces as a shape error in ``regionprops_table`` -- but
         it surfaces on the first *analysed* frame, i.e. after the run started.
     **kwargs:
-        Forwarded to ``CellposeV4``. Ignored by the fallback, which takes none
-        of Cellpose's parameters.
+        ``threshold`` and ``min_size`` are consumed by the fallback; anything
+        else is forwarded to ``CellposeV4``. Previously *every* kwarg went to
+        Cellpose and the fallback took none, so tuning ``min_size`` on a machine
+        without cellpose was silently ignored.
     """
+    # Measured on this rig's own frames (2026-08-28, 512 px ROI, 470 WF, 30 ms):
+    #
+    #   threshold  min_size   objects   median size
+    #        0.1          0       320          1 px   <- the old default
+    #        0.5        150     17-21     ~280 px
+    #
+    # The old default was not conservative, it was broken: these frames have a
+    # normalised median of 0.168, so a 0.1 threshold sits *below background* and
+    # returns 319 single-pixel specks plus one blob covering 67% of the field.
+    # That is what killed the 17:20 acquisition -- trackpy tried to link 320
+    # noise points, raised SubnetOversizeException, and the poisoned linker took
+    # tracking (and therefore every stim mask, and therefore FRAP) down with it.
+    # Otsu was tried and is worse here: it merges the field into 3 blobs of
+    # ~23,000 px, presumably from the illumination gradient.
+    # ``threshold`` means nothing to Cellpose, so it is fallback-only.
+    # ``min_size`` is accepted by both, so it is forwarded to whichever is used
+    # -- popping it unconditionally would silently swallow it once cellpose is
+    # installed. Left as None it keeps each segmentator's own default
+    # (Cellpose 50 px, fallback 150 px on this rig's frames).
+    threshold = kwargs.pop("threshold", 0.5)
+    min_size = kwargs.pop("min_size", None)
     try:
         from faro.segmentation.cellpose_v4 import CellposeV4
 
+        if min_size is not None:
+            kwargs["min_size"] = min_size
         return CellposeV4(**kwargs)
     except ImportError:
         from faro.segmentation.threshold import SegmentatorThreshold
 
         note = (
             "[inscoper_site] cellpose is not installed -- falling back to "
-            "SegmentatorThreshold(threshold=0.1)"
+            f"SegmentatorThreshold(threshold={threshold}, min_size={min_size}). "
+            "Check the object count on the first analysed frame: this fallback "
+            "cannot separate touching cells, and a count in the hundreds means "
+            "it is segmenting noise, not cells"
         )
-        inner = SegmentatorThreshold(threshold=0.1)
+        inner = SegmentatorThreshold(threshold=threshold, min_size=min_size)
         if multichannel:
             print(
                 note + ", max-projecting the channel axis so the labels come "
@@ -801,6 +869,138 @@ def make_segmentator(*, multichannel: bool = False, **kwargs):
 
 
 # -- napari -----------------------------------------------------------------
+
+
+# pymmcore-widgets handlers that are connected to *core* events and touch Qt
+# widgets. Only handlers reachable during an acquisition are listed: the
+# config/system-load ones fire from the GUI thread in practice.
+_QT_CALLBACK_GUARDS: dict[str, dict[str, tuple[str, ...]]] = {
+    "pymmcore_widgets.control._shutter_widget": {
+        "ShuttersWidget": (
+            "_on_channel_set",
+            "_on_shutter_device_changed",
+            "_on_shutter_state_changed",
+            "_on_autoshutter_changed",
+            "_on_live_mode",
+            "_refresh_shutter_widget",
+        )
+    },
+    "pymmcore_widgets.control._presets_widget": {
+        "PresetsWidget": ("_on_cfg_set", "_on_property_changed", "_refresh")
+    },
+    "pymmcore_widgets.control._camera_roi_widget": {
+        "CameraRoiWidget": ("_on_property_changed", "_on_roi_set", "_update_lbl_info")
+    },
+    "pymmcore_widgets.control._channel_group_widget": {
+        "ChannelGroupWidget": ("_on_property_changed", "_on_channel_group_changed")
+    },
+    "pymmcore_widgets.control._stage_widget": {"StageWidget": ("_on_prop_changed",)},
+    "pymmcore_widgets.control._exposure_widget": {
+        "ExposureWidget": ("_on_exp_changed",)
+    },
+    "pymmcore_widgets.control._live_button_widget": {
+        "LiveButton": ("_on_sequence_stopped",)
+    },
+    "pymmcore_widgets.device_properties._property_widget": {
+        "PropertyWidget": ("_on_core_change",),
+        "ChoiceWidget": ("_refresh_choices",),
+    },
+    "pymmcore_widgets.mda._core_mda": {
+        "MDAWidget": ("_on_mda_started", "_on_mda_finished", "_on_property_changed"),
+        "_MDAControlButtons": (
+            "_on_mda_started",
+            "_on_mda_finished",
+            "_on_mda_paused",
+        ),
+    },
+    "pymmcore_widgets.mda._core_positions": {
+        "CoreConnectedPositionTable": ("_on_property_changed", "_update_fov_size")
+    },
+    "pymmcore_widgets.mda._core_grid": {
+        "CoreConnectedGridPlanWidget": ("_update_fov_size",)
+    },
+    "pymmcore_widgets.mda._core_channels": {
+        "CoreConnectedChannelTable": ("_update_channel_groups",)
+    },
+}
+
+
+def guard_qt_widget_callbacks(*, verbose: bool = True) -> int:
+    """Make pymmcore-widgets' core-event handlers run on the GUI thread.
+
+    ``pymmcore-widgets`` connects widget methods straight to ``CMMCorePlus``
+    events, and psygnal calls them **synchronously on whichever thread emitted**.
+    During an acquisition that thread is the bridge's acquisition worker, so
+    ``ShuttersWidget._on_channel_set`` -- which calls
+    ``shutter_button.setEnabled()`` -- executes Qt widget code off the GUI
+    thread on every ``setConfig``. Qt widgets are not thread-safe, and this rig
+    has one shutter widget per shutter device, so a single snap can make a dozen
+    such calls.
+
+    That is what has been killing the kernel. Three crashes, three different
+    native exit codes -- 0xC0000374 (heap corruption), 0xC0000409 (fastfail) and
+    0xC0000005 (access violation) -- which is the signature of memory being
+    corrupted rather than of one deterministic bug: the process dies wherever
+    the damage happens to land. ``faulthandler`` caught the third one with the
+    acquisition worker sitting in
+    ``_snap_single_event -> setConfig -> _on_channel_set -> getShutterDevice``
+    while the main thread was inside ``processEvents()``. Hiding the widgets does
+    not help: a hidden widget is still connected.
+
+    Only ``_stack_viewer`` in the whole package guards its own handlers, so this
+    wraps the rest in :func:`superqt.utils.ensure_main_thread`, which calls
+    through directly when already on the GUI thread and marshals otherwise.
+
+    **Must run before the widgets are constructed.** psygnal stores a weak
+    reference plus the method it resolved at ``connect()`` time; if the class is
+    patched afterwards the slot no longer matches and psygnal *silently drops
+    it* (verified: connected slots go from 1 to 0), which would quietly stop the
+    widgets updating instead of fixing anything. :func:`open_napari` therefore
+    calls this before ``MainWindow`` exists.
+
+    Returns the number of methods wrapped. Never raises: a pymmcore-widgets
+    version without one of these names just skips it.
+    """
+    import importlib
+
+    try:
+        from superqt.utils import ensure_main_thread
+    except ImportError:
+        if verbose:
+            print("[inscoper_site] superqt missing -- Qt callbacks NOT guarded")
+        return 0
+
+    wrapped = 0
+    missing: list[str] = []
+    for mod_name, classes in _QT_CALLBACK_GUARDS.items():
+        try:
+            mod = importlib.import_module(mod_name)
+        except ImportError:
+            missing.append(mod_name)
+            continue
+        for cls_name, methods in classes.items():
+            cls = getattr(mod, cls_name, None)
+            if cls is None:
+                missing.append(f"{mod_name}.{cls_name}")
+                continue
+            for meth_name in methods:
+                fn = getattr(cls, meth_name, None)
+                if fn is None:
+                    missing.append(f"{cls_name}.{meth_name}")
+                    continue
+                if getattr(fn, "_inscoper_main_thread_guarded", False):
+                    continue
+                guarded = ensure_main_thread(fn)
+                guarded._inscoper_main_thread_guarded = True
+                setattr(cls, meth_name, guarded)
+                wrapped += 1
+    if verbose:
+        print(
+            f"[inscoper_site] guarded {wrapped} pymmcore-widgets callbacks so "
+            "they run on the GUI thread"
+            + (f" ({len(missing)} not found in this version)" if missing else "")
+        )
+    return wrapped
 
 
 def open_napari(mic, *, title: str | None = None):
@@ -820,6 +1020,10 @@ def open_napari(mic, *, title: str | None = None):
     """
     import napari
     from napari_micromanager import MainWindow
+
+    # Before MainWindow: psygnal binds these handlers at connect() time, so
+    # patching them later drops the connections instead of guarding them.
+    guard_qt_widget_callbacks()
 
     viewer = napari.Viewer(title=title or "Inscoper")
     with _z_moves_disarmed(mic.mmc):

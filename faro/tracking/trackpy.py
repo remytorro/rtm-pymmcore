@@ -70,9 +70,51 @@ class TrackerTrackpy(Tracker):
 
         else:
             # this is not the first frame
-            fov_state.linker.next_level(
-                coordinates, fov_state.fov_timestep_counter
-            )  # extract positions and convert to horizontal list
+            try:
+                fov_state.linker.next_level(
+                    coordinates, fov_state.fov_timestep_counter
+                )  # extract positions and convert to horizontal list
+            except Exception as exc:
+                # A trackpy Linker that raises inside next_level is left
+                # half-updated and is dead for good: the first failure here was
+                # SubnetOversizeException (search_range too large for the cell
+                # density -- 48 points in one subnet against trackpy's limit of
+                # 30), and every later frame then raised
+                # "'NoneType' object has no attribute 'add_point'" from the
+                # linker's own internals. Reusing it cost a whole acquisition:
+                # 33 consecutive failed frames, no tracks, therefore no stim
+                # masks, therefore no FRAP, while the controller waited out its
+                # mask timeout on every stim event (lag reached 199 s).
+                #
+                # So treat the linker as unrecoverable and start a new one on
+                # this frame's own detections. Tracking survives; the price is
+                # that particle IDs restart here, which is why this says so
+                # loudly rather than logging at debug level.
+                print(
+                    f"[trackpy] linker failed at frame "
+                    f"{fov_state.fov_timestep_counter} "
+                    f"({type(exc).__name__}: {exc}). A linker that raises is "
+                    "left in an inconsistent state, so it is being discarded "
+                    "and rebuilt from this frame's detections. PARTICLE IDS "
+                    "RESTART HERE -- tracks before and after this frame are "
+                    "not the same cells. If this repeats, search_range="
+                    f"{self.search_range} is too large for this sample's "
+                    "density: lower it (and adaptive_stop) rather than letting "
+                    "every frame rebuild."
+                )
+                fov_state.linker = trackpy.linking.Linker(
+                    search_range=self.search_range,
+                    memory=self.memory,
+                    adaptive_stop=self.adaptive_stop,
+                    adaptive_step=self.adaptive_step,
+                )
+                fov_state.linker.init_level(
+                    coordinates, fov_state.fov_timestep_counter
+                )
+                df_new["particle"] = fov_state.linker.particle_ids
+                df_new["fov_timestep"] = fov_state.fov_timestep_counter
+                return df_new.reset_index(drop=True)
+
             df_new["particle"] = fov_state.linker.particle_ids
             df_new["fov_timestep"] = fov_state.fov_timestep_counter
             df_tracked = pd.concat([df_old, df_new])
